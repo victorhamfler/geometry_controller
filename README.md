@@ -1,4 +1,4 @@
-﻿# LCM Geometry Module
+# LCM Geometry Module
 
 Semantic memory overlay for OpenClaw LCM.
 

@@ -2,8 +2,8 @@
 
 **Version:** 1.0
 **Module:** `lcm_geometry_controller.py`
-**Geometry DB:** `~/.openclaw/lcm_geometry.db`
-**LCM DB:** `~/.openclaw/lcm.db`
+**Geometry DB:** `<openclaw_home>/lcm_geometry.db`
+**LCM DB:** `<openclaw_home>/lcm.db`
 **Last Updated:** 2026-04-04
 
 ---
@@ -91,10 +91,10 @@ source ~/venvs/ml/bin/activate
 
 # Check module works
 python3 -c "
-import sys; sys.path.insert(0, '/home/victo/.openclaw/workspace/module')
+import sys; sys.path.insert(0, '<module_repo_root>')
 from lcm_geometry_controller import create_geometry_controller, EmbeddingProvider
 gc = create_geometry_controller(
-    '/home/victo/.openclaw/lcm_geometry.db',
+    '<openclaw_home>/lcm_geometry.db',
     embedding_provider=EmbeddingProvider()
 )
 print('OK —', gc.db.conn.execute('SELECT COUNT(*) FROM branch_states').fetchone()[0], 'branches')
@@ -105,11 +105,11 @@ print('OK —', gc.db.conn.execute('SELECT COUNT(*) FROM branch_states').fetchon
 
 ```python
 import sys
-sys.path.insert(0, '/home/victo/.openclaw/workspace/module')
+sys.path.insert(0, '<module_repo_root>')
 from lcm_geometry_controller import create_geometry_controller, EmbeddingProvider, NodeType
 
 gc = create_geometry_controller(
-    '/home/victo/.openclaw/lcm_geometry.db',
+    '<openclaw_home>/lcm_geometry.db',
     embedding_provider=EmbeddingProvider()
 )
 
@@ -446,14 +446,14 @@ Run `gc.run_maintenance_cycle()` every 20–30 minutes. It:
 
 ```bash
 # Every 30 minutes
-*/30 * * * * cd /home/victo && \
-  /home/victo/venvs/ml/bin/python3 -c "
-import sys; sys.path.insert(0, '/home/victo/.openclaw/workspace/module')
+*/30 * * * * cd <user_home> && \
+  <python_executable> -c "
+import sys; sys.path.insert(0, '<module_repo_root>')
 from lcm_geometry_controller import GeometryController
-gc = GeometryController('/home/victo/.openclaw/lcm_geometry.db')
+gc = GeometryController('<openclaw_home>/lcm_geometry.db')
 r = gc.run_maintenance_cycle()
 print(f'maint: recomputed={r[\"recomputed\"]} split={r[\"split_pending\"]} merge={r[\"merge_candidates\"]}')
-" >> /home/victo/.openclaw/logs/geometry_maint.log 2>&1
+" >> <openclaw_home>/logs/geometry_maint.log 2>&1
 ```
 
 Or via OpenClaw heartbeat (edit `HEARTBEAT.md`):
@@ -471,15 +471,15 @@ If you're starting fresh (no `lcm_geometry.db` yet), run the backfill once to po
 
 ```python
 import sys
-sys.path.insert(0, '/home/victo/.openclaw/workspace/module')
+sys.path.insert(0, '<module_repo_root>')
 from lcm_geometry_controller import GeometryController, EmbeddingProvider
 import time
 
-gc = GeometryController('/home/victo/.openclaw/lcm_geometry.db',
+gc = GeometryController('<openclaw_home>/lcm_geometry.db',
                         embedding_provider=EmbeddingProvider())
 
 start = time.time()
-r = gc.backfill_from_lcm('/home/victo/.openclaw/lcm.db', resume=False)
+r = gc.backfill_from_lcm('<openclaw_home>/lcm.db', resume=False)
 elapsed = time.time() - start
 
 print(f"Backfill done in {elapsed:.1f}s")
@@ -489,13 +489,13 @@ print(f"  processed={r['processed']} sampled={r.get('sampled',0)} "
 
 Then import DAG edges:
 ```python
-r2 = gc.import_dag_edges_from_lcm('/home/victo/.openclaw/lcm.db')
+r2 = gc.import_dag_edges_from_lcm('<openclaw_home>/lcm.db')
 print(f"Edges: {r2['derived_from']} derived_from + {r2['summarizes']} summarizes")
 ```
 
 For incremental updates (new messages since last backfill):
 ```python
-gc.backfill_from_lcm('/home/victo/.openclaw/lcm.db', resume=True)
+gc.backfill_from_lcm('<openclaw_home>/lcm.db', resume=True)
 ```
 
 ---
@@ -527,7 +527,7 @@ These edges enable:
 
 ## 12. MCP Server Tools
 
-The OpenClaw MCP server (`~/.openclaw/extensions/geometry-mcp/server.py`) exposes four tools:
+The OpenClaw MCP server (`<openclaw_home>/extensions/geometry-mcp/server.py`) exposes four tools:
 
 ### `geometry-hybrid__hybrid_search`
 
@@ -578,12 +578,12 @@ Supports:
 
 ### MCP Server Registration
 
-Registered in `~/.openclaw/openclaw.json` under `mcp.servers`:
+Registered in `<openclaw_home>/openclaw.json` under `mcp.servers`:
 
 ```json
 "geometry-hybrid": {
-  "command": "/home/victo/venvs/ml/bin/python3",
-  "args": ["/home/victo/.openclaw/extensions/geometry-mcp/server.py"]
+  "command": "<python_executable>",
+  "args": ["<openclaw_home>/extensions/geometry-mcp/server.py"]
 }
 ```
 
@@ -596,7 +596,7 @@ openclaw gateway restart
 
 ## 13. All 5 Fixes Applied
 
-These fixes were applied on 2026-04-04 to the module at `~/.openclaw/workspace/module/lcm_geometry_controller.py` (1701 lines).
+These fixes were applied on 2026-04-04 to the module at `<module_repo_root>/lcm_geometry_controller.py`.
 
 ### Fix 1 — EmbeddingProvider (New Feature)
 
@@ -681,7 +681,7 @@ ModuleNotFoundError: No module named 'lcm_geometry_controller'
 **Fix:** Add module path:
 ```python
 import sys
-sys.path.insert(0, '/home/victo/.openclaw/workspace/module')
+sys.path.insert(0, '<module_repo_root>')
 from lcm_geometry_controller import ...
 ```
 
@@ -714,7 +714,7 @@ openclaw mcp list
 
 If `recomputed` count is low despite Fix 5 being applied, check:
 ```python
-gc = GeometryController('/home/victo/.openclaw/lcm_geometry.db')
+gc = GeometryController('<openclaw_home>/lcm_geometry.db')
 for s in gc.db.all_branches():
     if not s.mean_vec:
         print(f"{s.branch_id}: NO mean_vec — will use fallback")
@@ -728,19 +728,19 @@ Ensure `embedding_dim` in `GeometryConfig` matches your embedding model (default
 
 Use `resume=True` for incremental updates:
 ```python
-gc.backfill_from_lcm('/home/victo/.openclaw/lcm.db', resume=True)
+gc.backfill_from_lcm('<openclaw_home>/lcm.db', resume=True)
 ```
 
 For large conversations (>200 messages), the backfill stratifies to 200 samples. To process all messages:
 ```python
-gc.backfill_from_lcm('/home/victo/.openclaw/lcm.db', resume=True, force_full=True)
+gc.backfill_from_lcm('<openclaw_home>/lcm.db', resume=True, force_full=True)
 ```
 
 ### Gateway restart kills tmux sessions
 
 Restart tandem after gateway restart:
 ```bash
-~/.openclaw/start-tandem.sh
+<openclaw_home>/start-tandem.sh
 ```
 
 ---
@@ -750,11 +750,11 @@ Restart tandem after gateway restart:
 ```python
 # Setup (one time)
 import sys
-sys.path.insert(0, '/home/victo/.openclaw/workspace/module')
+sys.path.insert(0, '<module_repo_root>')
 from lcm_geometry_controller import create_geometry_controller, EmbeddingProvider
 
 gc = create_geometry_controller(
-    '/home/victo/.openclaw/lcm_geometry.db',
+    '<openclaw_home>/lcm_geometry.db',
     embedding_provider=EmbeddingProvider()
 )
 
@@ -779,12 +779,12 @@ print(r['state'], r['regime'], r['eff_rank'])
 gc.run_maintenance_cycle()
 
 # Incremental backfill
-gc.backfill_from_lcm('/home/victo/.openclaw/lcm.db', resume=True)
+gc.backfill_from_lcm('<openclaw_home>/lcm.db', resume=True)
 ```
 
 ---
 
 *Manual generated: 2026-04-04*
-*Module: `~/.openclaw/workspace/module/lcm_geometry_controller.py` (1701 lines)*
-*Companion backfill script: `~/.openclaw/workspace/module/lcm_geometry_backfill.py`*
-*MCP server: `~/.openclaw/extensions/geometry-mcp/server.py`*
+*Module: `<module_repo_root>/lcm_geometry_controller.py`*
+*Companion backfill script: `<module_repo_root>/lcm_geometry_backfill.py`*
+*MCP server: `<openclaw_home>/extensions/geometry-mcp/server.py`*
