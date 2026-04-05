@@ -32,3 +32,13 @@ Current tool surface:
 - `branch_report`
 - `geometry_stats`
 - `conversation_content`
+
+## License
+
+This repository is released under the MIT License. See `LICENSE`.
+
+## Compatibility and attribution
+
+This module is designed to interoperate with OpenClaw and the `@martian-engineering/lossless-claw` ecosystem by reading LCM data structures (for example `lcm.db` messages/summaries) and writing its own companion database.
+
+No direct source-code copy from `lossless-claw` is required for this repository to function. If you later import or copy substantial code from that project, keep its original MIT copyright/license notice in the copied files.
