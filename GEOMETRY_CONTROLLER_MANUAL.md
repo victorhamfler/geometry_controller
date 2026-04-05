@@ -4,7 +4,7 @@
 **Module:** `lcm_geometry_controller.py`
 **Geometry DB:** `<openclaw_home>/lcm_geometry.db`
 **LCM DB:** `<openclaw_home>/lcm.db`
-**Last Updated:** 2026-04-04
+**Last Updated:** 2026-04-05
 
 ---
 
@@ -64,7 +64,7 @@ Each conversation branch gets:
 - `mean_vec` — 384-dim centroid (EMA-updated as messages are added)
 - `cov_diagonal` — variance per dimension
 - `eff_rank` — effective rank of the embedding cloud (how many orthogonal directions are actually used)
-- `anisotropy` — ratio of smallest to largest eigenvalue (0 = isotropic, 1 = maximally anisotropic)
+- `anisotropy` — concentration proxy computed from variance spectrum (`max_eigenvalue / sum_eigenvalues`)
 - `coherence` — mean pairwise cosine similarity of messages in branch
 - `trace` — sum of variances (total spread)
 - `anchor_drift` — how much the centroid has shifted since the anchor was set
@@ -159,7 +159,7 @@ print(r['state'], r['regime'], r['eff_rank'], r['coherence'])
 | `mean_vec` | TEXT (JSON) | 384-dim centroid as JSON list |
 | `cov_diagonal` | TEXT (JSON) | Variance per dimension |
 | `eff_rank` | REAL | Effective rank (1–384) |
-| `anisotropy` | REAL | Ratio smallest/largest eigenvalue (0–1) |
+| `anisotropy` | REAL | Variance concentration proxy (`max_eigenvalue / sum_eigenvalues`) |
 | `coherence` | REAL | Mean pairwise cosine similarity |
 | `trace` | REAL | Sum of variances |
 | `compression_loss` | REAL | Compression error (reconstruction from low-rank) |
@@ -460,7 +460,7 @@ Or via OpenClaw heartbeat (edit `HEARTBEAT.md`):
 ```markdown
 # HEARTBEAT.md
 - Run maintenance every ~30 min:
-  `python3 -c "from lcm_geometry_controller import GeometryController; gc.run_maintenance_cycle()"`
+  `python3 -c "import sys; sys.path.insert(0, '<module_repo_root>'); from lcm_geometry_controller import GeometryController; gc = GeometryController('<openclaw_home>/lcm_geometry.db'); print(gc.run_maintenance_cycle())"`
 ```
 
 ---
@@ -600,7 +600,7 @@ These fixes were applied on 2026-04-04 to the module at `<module_repo_root>/lcm_
 
 ### Fix 1 — EmbeddingProvider (New Feature)
 
-**What:** Added `EmbeddingProvider` class — pluggable embedding backend with lazy model loading, in-memory LRU cache, `embed()` and `embed_batch()` methods.
+**What:** Added `EmbeddingProvider` class — pluggable embedding backend with lazy model loading, in-memory cache, `embed()` and `embed_batch()` methods.
 
 **Integration:** Passed to `GeometryController(embedding_provider=EmbeddingProvider())`. `on_new_item()` now accepts `text=` directly — auto-embeds via provider.
 
@@ -610,7 +610,7 @@ These fixes were applied on 2026-04-04 to the module at `<module_repo_root>/lcm_
 
 **Bug:** `_residual()` used `hasattr(self.cfg, "EPS")` which was always `False` (GeometryConfig has no EPS attribute). First message in any branch got `csd=inf`.
 
-**Fix:** Direct `if expected == 0.0` check with `expected = max(abs(delta), 1e-6)`.
+**Fix:** Residual denominator is floor-clamped (`expected = max(expected, 1e-6)`), which prevents divide-by-zero behavior on first inserts and keeps CSD finite.
 
 **Result:** First-insert CSD = 0.0 (finite, correct — new branch is always a valid attachment target).
 
@@ -731,9 +731,9 @@ Use `resume=True` for incremental updates:
 gc.backfill_from_lcm('<openclaw_home>/lcm.db', resume=True)
 ```
 
-For large conversations (>200 messages), the backfill stratifies to 200 samples. To process all messages:
+For large conversations (>200 messages), the backfill stratifies to `max_per_conv` samples (default 200). To increase coverage, raise `max_per_conv`:
 ```python
-gc.backfill_from_lcm('<openclaw_home>/lcm.db', resume=True, force_full=True)
+gc.backfill_from_lcm('<openclaw_home>/lcm.db', resume=True, max_per_conv=1000)
 ```
 
 ### Gateway restart kills tmux sessions
