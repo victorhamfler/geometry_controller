@@ -33,7 +33,6 @@ The `geometry-hybrid` MCP server exposes 4 tools:
 ## Repository notes
 
 - This repository includes only the module, docs, and smoke test.
-- Excluded artifacts: `__pycache__`, `*.pyc`, `:Zone.Identifier`, transient logs/progress files.
 
 ## Quick runbook
 
