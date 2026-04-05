@@ -1,22 +1,35 @@
 #!/usr/bin/env python3
 """
-LCM Geometry Backfill — Full DB with sentence-transformers embeddings
-Run: source ~/venvs/ml/bin/activate && python3 lcm_geometry_backfill.py
+LCM Geometry Backfill - Full DB with sentence-transformers embeddings
+Run: python3 lcm_geometry_backfill.py (optionally set OPENCLAW_HOME and GEOMETRY_MODULE_HOME)
 """
 import sqlite3, time, tempfile, os, sys, numpy as np, json, shutil, random
 from collections import defaultdict
+from pathlib import Path
 
-sys.path.insert(0, '/home/victo/.openclaw/workspace/module')
+REPO_ROOT = Path(__file__).resolve().parent
+OPENCLAW_HOME = Path(os.environ.get('OPENCLAW_HOME', str(Path.home() / '.openclaw'))).expanduser()
+MODULE_HOME = Path(os.environ.get('GEOMETRY_MODULE_HOME', str(OPENCLAW_HOME / 'workspace' / 'module'))).expanduser()
+
+# Allow imports when running from either the repository root or deployed OpenClaw module folder.
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(MODULE_HOME))
+
 from lcm_geometry_controller import (
     GeometryController, GeometryConfig, NodeType, create_geometry_controller,
     BranchState, GeometricRegime, BranchStats, MemoryNode, GeometryMath
 )
 from sentence_transformers import SentenceTransformer
 
-OUTPUT_DB = '/home/victo/.openclaw/lcm_geometry.db'
-PROGRESS_FILE = '/home/victo/.openclaw/workspace/module/backfill_progress.json'
-LOG_FILE = '/home/victo/.openclaw/workspace/module/backfill.log'
+OUTPUT_DB = str(OPENCLAW_HOME / 'lcm_geometry.db')
+PROGRESS_FILE = str(MODULE_HOME / 'backfill_progress.json')
+LOG_FILE = str(MODULE_HOME / 'backfill.log')
+LCM_DB = str(OPENCLAW_HOME / 'lcm.db')
 MAX_MSGS_PER_CONV = 200
+
+MODULE_HOME.mkdir(parents=True, exist_ok=True)
+if not Path(LCM_DB).exists():
+    raise FileNotFoundError(f"LCM database not found: {LCM_DB}")
 
 def log(msg):
     ts = time.strftime('%H:%M:%S')
@@ -33,7 +46,7 @@ model = SentenceTransformer('all-MiniLM-L6-v2')
 log(f"Model loaded in {time.time()-t0:.1f}s | dim={DIM}")
 
 log("Loading LCM data...")
-lcm_conn = sqlite3.connect('/home/victo/.openclaw/lcm.db')
+lcm_conn = sqlite3.connect(LCM_DB)
 cur = lcm_conn.execute('''
     SELECT m.message_id, m.conversation_id, m.seq, m.role, m.content, m.token_count
     FROM messages m ORDER BY m.conversation_id, m.seq
@@ -146,7 +159,7 @@ states = Counter(b.state.value for b in all_b if b)
 regimes = Counter(b.regime.value for b in all_b if b)
 
 log(f"\n{'='*50}")
-log(f"DONE — {OUTPUT_DB} ({sz:.0f} KB)")
+log(f"DONE - {OUTPUT_DB} ({sz:.0f} KB)")
 log(f"Branches: {len(all_b)} | States: {dict(states)} | Regimes: {dict(regimes)}")
 log(f"Total time: {enc_time + time.time()-t0:.0f}s")
 for bs in all_bs[:5]:
@@ -156,3 +169,5 @@ for bs in all_bs[:5]:
 q = np.zeros(DIM, dtype=np.float32)
 ranked = gc.rank_retrieval(q.tolist())
 log(f"Retrieval: {len(ranked)} candidates | top: {ranked[0].branch_id if ranked else 'none'}")
+
+

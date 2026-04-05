@@ -1,42 +1,73 @@
 # LCM Geometry Module - Project Summary
 
-**Status:** Active (MCP runtime)  
-**Updated:** 2026-04-05
+**Status:** Active (OpenClaw + MCP runtime)  
+**Last Updated:** 2026-04-05
 
-## What this project does
+## Purpose
 
-The LCM Geometry module adds semantic retrieval and branch diagnostics on top of OpenClaw LCM.  
-It is read-only with respect to `lcm.db` and stores geometry state in `lcm_geometry.db`.
+This project adds a semantic geometry layer on top of OpenClaw LCM memory.
 
-Main capabilities:
-- semantic branch ranking from embeddings
-- branch-level geometry metrics (coherence, anisotropy, effective rank)
-- branch lifecycle tracking for maintenance and retrieval trust
-- MCP tools for hybrid search and content bridging
+- Source of truth remains `lcm.db` (messages/summaries)
+- Geometry signals and retrieval metadata are stored in `lcm_geometry.db`
+- MCP server exposes the geometry layer as tools for agents
 
-## Runtime architecture
+## Current runtime architecture
 
-- Native memory source: `lcm.db`
-- Geometry companion database: `lcm_geometry.db`
-- Engine module: `lcm_geometry_controller.py`
-- Backfill/import utility: `lcm_geometry_backfill.py`
-- MCP server: `extensions/geometry-mcp/server.py`
+- `lcm_geometry_controller.py`: branch geometry engine
+- `lcm_geometry_backfill.py`: creates/refreshes geometry DB from LCM
+- `extensions/geometry-mcp/server.py`: MCP tool server
+- OpenClaw runtime data:
+  - `<openclaw_home>/lcm.db`
+  - `<openclaw_home>/lcm_geometry.db`
 
-## MCP tools (current)
+## What is required for a working setup
 
-The `geometry-hybrid` MCP server exposes 4 tools:
+1. Python dependencies installed from `requirements.txt`
+2. Engine files deployed to OpenClaw module path:
+   - `<openclaw_home>/workspace/module/lcm_geometry_controller.py`
+   - `<openclaw_home>/workspace/module/lcm_geometry_backfill.py`
+3. MCP entrypoint deployed:
+   - `<openclaw_home>/extensions/geometry-mcp/server.py`
+4. Geometry DB generated (or refreshed) by running backfill
+5. MCP server configured in OpenClaw as `geometry-hybrid`
+
+## Installation and deployment checklist
+
+```bash
+# 1) install deps
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# 2) deploy files
+export OPENCLAW_HOME="$HOME/.openclaw"
+mkdir -p "$OPENCLAW_HOME/workspace/module"
+mkdir -p "$OPENCLAW_HOME/extensions/geometry-mcp"
+cp lcm_geometry_controller.py "$OPENCLAW_HOME/workspace/module/"
+cp lcm_geometry_backfill.py "$OPENCLAW_HOME/workspace/module/"
+cp extensions/geometry-mcp/server.py "$OPENCLAW_HOME/extensions/geometry-mcp/"
+
+# 3) build geometry db
+OPENCLAW_HOME="$OPENCLAW_HOME" \
+GEOMETRY_MODULE_HOME="$OPENCLAW_HOME/workspace/module" \
+python3 lcm_geometry_backfill.py
+
+# 4) register MCP server + restart
+openclaw mcp set geometry-hybrid '{"command":"python3","args":["<openclaw_home>/extensions/geometry-mcp/server.py"]}'
+openclaw gateway restart
+openclaw mcp list
+```
+
+## MCP tool surface (current)
+
 - `hybrid_search`
 - `branch_report`
 - `geometry_stats`
 - `conversation_content`
 
-## Repository notes
+## Operational notes
 
-- This repository includes only the module, docs, and smoke test.
-
-## Quick runbook
-
-1. Install dependencies from `requirements.txt`.
-2. Run `python3 scripts/smoke_test_geometry.py`.
-3. Configure OpenClaw MCP to run `extensions/geometry-mcp/server.py`.
-4. Restart gateway and validate `geometry-hybrid` appears in `openclaw mcp list`.
+- Backfill is the key synchronization step between LCM and geometry.
+- If retrieval quality drops or results look stale, run backfill again.
+- `GEOMETRY_CONTROLLER_MANUAL.md` is the full reference.
+- `GEOMETRY_MODULE_TUTORIAL.md` is the practical user/agent guide.
