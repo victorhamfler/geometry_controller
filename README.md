@@ -15,6 +15,17 @@ Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geomet
 - Added split execution path:
   - pending split jobs are executed with internal k-means(2)
   - child branches are created and linked with `REFINES` edges
+- Hardened split gating and queue behavior:
+  - split scoring threshold is config-driven (`split_score_threshold`)
+  - split readiness requires both state/node rows and real embedded rows
+  - readiness uses `max(split_min_nodes, min_branch_size)` to avoid small-branch over-triggering
+  - per-cycle split enqueue cap (`max_split_enqueues_per_cycle`) with score-priority selection
+- Added split decision observability:
+  - persisted per-branch maintenance trace rows in `maintenance_split_observations`
+  - reasons include candidate, throttled, enqueued rank, and gate/hysteresis outcomes
+- Improved backfill operational reliability:
+  - branch-locked insertion via `force_branch_id` to preserve conversation-to-branch topology
+  - structured backfill error logging with `errors_logged` count in returned stats
 - Added operations APIs:
   - `health_report()`
   - `mark_branch_agent_interest(...)`

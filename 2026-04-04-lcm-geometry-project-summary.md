@@ -34,6 +34,17 @@ This project adds a semantic geometry layer on top of OpenClaw LCM memory.
   - pending split jobs executed automatically
   - internal k-means(2) branch partitioning
   - `REFINES` edges from source to child branches
+- Split gate hardening and throttling:
+  - score gate uses `split_score_threshold`
+  - readiness uses `max(split_min_nodes, min_branch_size)`
+  - real embedded-node gate required before split hysteresis can accumulate
+  - per-cycle split enqueue cap with score-priority selection
+- Split observability:
+  - per-branch split decisions persisted in `maintenance_split_observations`
+  - maintenance output includes `split_trace_run_id` and `split_observations`
+- Backfill reliability:
+  - deterministic branch-lock insertion keeps `conv_<conversation_id>` mapping stable
+  - structured backfill error logging and `errors_logged` metric
 - Operational observability APIs:
   - `health_report()`
   - cross-agent links (`mark_branch_agent_interest`, `add_cross_agent_shared_edge`, `list_cross_agent_links`)

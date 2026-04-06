@@ -65,7 +65,9 @@ Recommended flow: `hybrid_search` -> `branch_report` (if needed) -> `conversatio
 | `tension_threshold` | `0.70` | CSD in `[attach_threshold, tension_threshold)` -> `attach_tension`; above -> `fork` |
 | `alpha_sem` | `0.60` | Semantic weight in retrieval ranking |
 | `beta_trust` | `0.25` | Trust/quality weight in retrieval ranking |
-| `split_min_nodes` | `6` | Minimum nodes before split execution is allowed |
+| `split_score_threshold` | `0.075` | Split score gate threshold |
+| `split_min_nodes` | `6` | Baseline split gate; effective readiness uses `max(split_min_nodes, min_branch_size)` |
+| `max_split_enqueues_per_cycle` | `5` | Maximum split jobs queued in one maintenance cycle (highest scores first) |
 | `merge_signal_lookback` | `5000` | Retrieval co-use lookback rows for merge scoring |
 | `contradiction_sim_threshold` | `-0.30` | Cosine threshold used to detect contradiction pairs |
 
@@ -123,6 +125,7 @@ This preserves a rowid cursor and processes only new messages.
 
 - Run `run_maintenance_cycle()` periodically (for example every 20-30 minutes).
 - Use `resume=True` for incremental backfill runs.
+- Check `split_trace_run_id` and `split_observations` from maintenance output when validating split behavior.
 - Use `gc.health_report()` for quick state/regime and pending-job visibility.
 - Keep this tutorial aligned with `GEOMETRY_CONTROLLER_MANUAL.md` when behavior changes.
 

@@ -1,6 +1,6 @@
 # LCM Geometry Controller — Manual
 
-**Version:** 1.2
+**Version:** 1.3
 **Module:** `lcm_geometry_controller.py`
 **Geometry DB:** `<openclaw_home>/lcm_geometry.db`
 **LCM DB:** `<openclaw_home>/lcm.db`
@@ -205,6 +205,23 @@ print(r['state'], r['regime'], r['eff_rank'], r['coherence'])
 | `usefulness` | REAL | User/agent signal: was this retrieval useful? |
 | `ts` | REAL | Timestamp |
 
+### `maintenance_split_observations` — Split Decision Trace
+
+Stores per-branch split gate outcomes for each maintenance run.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `run_id` | TEXT | Maintenance run correlation id |
+| `branch_id` | TEXT | Branch evaluated in that run |
+| `split_score` | REAL | Computed split score |
+| `split_threshold` | REAL | Threshold used in that run |
+| `gate_nodes` | INT | Node count gate (0/1) |
+| `gate_score` | INT | Score threshold gate (0/1) |
+| `gate_hysteresis` | INT | Hysteresis counter gate (0/1) |
+| `should_split` | INT | Final split eligibility before cap (0/1) |
+| `enqueued` | INT | Whether a split job was queued (0/1) |
+| `reason` | TEXT | Semicolon-separated decision reasons (`eligible_candidate`, `eligible_throttled`, `eligible_enqueued_rank`, etc.) |
+
 ---
 
 ## 5. Core API Reference
@@ -219,7 +236,7 @@ gc = GeometryController('/path/to/lcm_geometry.db', cfg=GeometryConfig())
 gc = GeometryController('/path/to/lcm_geometry.db', embedding_provider=EmbeddingProvider())
 ```
 
-### `gc.on_new_item(lcm_id, node_type, embedding=None, role='user', token_count=0, conflict_score=0.0, active_branch_id=None, parent_lcm_id=None, text=None)`
+### `gc.on_new_item(lcm_id, node_type, embedding=None, role='user', token_count=0, conflict_score=0.0, active_branch_id=None, force_branch_id=None, parent_lcm_id=None, text=None)`
 
 Called after LCM persists a new message/summary. Computes CSD score against all active branches, decides where to attach.
 
@@ -231,6 +248,7 @@ Called after LCM persists a new message/summary. Computes CSD score against all 
 - **`token_count`** — approximate token count
 - **`conflict_score`** - optional conflict severity signal for CSD scoring
 - **`active_branch_id`** - preferred branch hint from caller runtime
+- **`force_branch_id`** - bypass candidate selection and attach to a specific branch id (used by deterministic backfill mapping)
 - **`parent_lcm_id`** - parent LCM id; controller resolves parent node and links DAG/temporal edges
 
 **Returns:** `AllocationDecision` with fields:
@@ -285,7 +303,7 @@ Full maintenance sweep over all branches. Should be run periodically (every 20�
 1. **Recomputes geometry** for each branch from its `memory_nodes` rows
 2. **Refreshes contradiction signals** (density + bounded `CONTRADICTS` edges)
 3. **Reclassifies regime** - PRODUCTIVE / RIGID / UNSTABLE
-4. **Scans for splits and queues jobs** when hysteresis conditions are met
+4. **Scans for splits and prepares ranked candidates** when gate + hysteresis conditions are met
 5. **Scores merges with runtime signals** (graph overlap + retrieval co-use)
 6. **Executes pending split jobs** (k-means(2), child branches, `REFINES` edges)
 7. **Runs reactivation scan**
@@ -297,19 +315,23 @@ Full maintenance sweep over all branches. Should be run periodically (every 20�
     'split_pending': 0,
     'split_executed': 0,
     'merge_candidates': 0,
-    'reactivated': 0
+    'reactivated': 0,
+    'split_observations': 437,
+    'split_trace_run_id': '...'
 }
 ```
 
-### `gc.backfill_from_lcm(lcm_db_path, resume=True, progress_cb=None)`
+### `gc.backfill_from_lcm(lcm_db_path, resume=True, progress_cb=None, max_per_conv=200, error_log_path=None)`
 
 One-time backfill from LCM. Creates `memory_nodes` rows for all messages and summaries.
 
 - **`lcm_db_path`** — path to `lcm.db`
 - **`resume`** — if True, skips branches that already have `node_count > 0`
 - **`progress_cb`** — callback `(current, total) → None` for progress tracking
+- **`max_per_conv`** — cap per-conversation sampled rows in large histories
+- **`error_log_path`** — optional target file for structured per-conversation backfill errors
 
-**Returns:** `dict` with `processed`, `sampled`, `skipped`, `failed` counts.
+**Returns:** `dict` with `processed`, `sampled`, `skipped`, `failed`, `errors_logged`.
 
 ### `gc.import_dag_edges_from_lcm(lcm_db_path)`
 
@@ -356,7 +378,10 @@ gc = GeometryController('/path/to/lcm_geometry.db', cfg=cfg)
 | `alpha_sem` | 0.60 | Semantic similarity weight in retrieval |
 | `beta_trust` | 0.25 | Trust score weight in retrieval |
 | `delta_react` | 0.15 | Reactivation weight in retrieval |
+| `split_score_threshold` | 0.075 | Split score threshold used by split eligibility |
+| `split_min_nodes` | 6 | Baseline split gate; effective gate uses `max(split_min_nodes, min_branch_size)` |
 | `split_hysteresis` | 3 | Consecutive high scores → SPLIT_PENDING |
+| `max_split_enqueues_per_cycle` | 5 | Maximum split jobs enqueued per maintenance cycle (score-ranked) |
 | `merge_hysteresis` | 3 | Consecutive merge candidates → MERGE_CANDIDATE |
 | `usefulness_lambda` | 0.10 | EMA decay for usefulness signals |
 | `rank_target` | dict | eff_rank target bands per branch type |
@@ -445,7 +470,12 @@ Run `gc.run_maintenance_cycle()` every 20–30 minutes. It:
 1. **Recomputes geometry** for each branch from its `memory_nodes` rows
 2. **Updates scalars** (eff_rank, anisotropy, coherence, trace) via adiabatic EMA
 3. **Reclassifies regime** — PRODUCTIVE / RIGID / UNSTABLE
-4. **Scans for splits** — if `split_score > 0.55` for `split_hysteresis` consecutive cycles → `SPLIT_PENDING`
+4. **Scans for splits** — branch must pass:
+   - score gate: `split_score > split_score_threshold`
+   - node readiness gate: `node_count >= max(split_min_nodes, min_branch_size)`
+   - real-node readiness gate: embedded rows also meet the same threshold
+   - hysteresis gate: `split_counter >= split_hysteresis`
+   Eligible branches are score-ranked and throttled by `max_split_enqueues_per_cycle`.
 5. **Scans for merges** — stable branches with high topic overlap → `MERGE_CANDIDATE`
 
 ### Running as Cron
@@ -490,7 +520,7 @@ elapsed = time.time() - start
 
 print(f"Backfill done in {elapsed:.1f}s")
 print(f"  processed={r['processed']} sampled={r.get('sampled',0)} "
-      f"skipped={r['skipped']} failed={r['failed']}")
+      f"skipped={r['skipped']} failed={r['failed']} errors_logged={r.get('errors_logged',0)}")
 ```
 
 Then import DAG edges:
@@ -503,6 +533,8 @@ For incremental updates (new messages since last backfill):
 ```python
 gc.backfill_from_lcm('<openclaw_home>/lcm.db', resume=True)
 ```
+
+Backfill uses deterministic conversation mapping (`conv_<conversation_id>`) and branch-locked insertion, so branch IDs remain aligned with LCM conversation IDs.
 
 ---
 
@@ -617,12 +649,23 @@ The current controller build includes these production features:
    - pending split jobs consumed by `execute_pending_splits(...)`
    - internal k-means(2) partition
    - child branch creation + `REFINES` edges
-7. **Operational observability APIs**:
+7. **Split gating hardening and throttling**:
+   - score threshold is config-driven (`split_score_threshold`)
+   - split readiness uses `max(split_min_nodes, min_branch_size)`
+   - real embedded-node gate prevents sparse/placeholder branches from accumulating split hysteresis
+   - per-cycle queue cap (`max_split_enqueues_per_cycle`) with score-priority selection
+8. **Split observability persistence**:
+   - per-branch split gate traces in `maintenance_split_observations`
+   - per-cycle trace id in maintenance return (`split_trace_run_id`)
+9. **Operational observability APIs**:
    - `health_report()`
    - `mark_branch_agent_interest(...)`
    - `add_cross_agent_shared_edge(...)`
    - `list_cross_agent_links(...)`
-8. **Persisted CSD EMA state** (`csd_ema_state`) and retrieval history consistency updates.
+10. **Backfill reliability improvements**:
+    - deterministic branch-lock insertion via `force_branch_id`
+    - structured backfill error log writing + `errors_logged` return metric
+11. **Persisted CSD EMA state** (`csd_ema_state`) and retrieval history consistency updates.
 
 ---
 
@@ -632,6 +675,8 @@ The current controller build includes these production features:
 
 - Incremental LCM polling API exists in controller (`poll_lcm_for_new_items`).
 - Maintenance covers contradiction refresh, merge signal scoring, split queueing, and split execution.
+- Split queueing is gate-hardened and per-cycle throttled with persisted decision traces.
+- Backfill preserves conversation branch topology with deterministic branch-locked insertion.
 - Cross-agent edge APIs are available and persisted in geometry DB.
 
 ### Optional runtime wiring (deployment choice)
@@ -755,7 +800,7 @@ gc.backfill_from_lcm('<openclaw_home>/lcm.db', resume=True)
 
 ---
 
-*Manual generated: 2026-04-04*
+*Manual generated: 2026-04-06*
 *Module: `<module_repo_root>/lcm_geometry_controller.py`*
 *Companion backfill script: `<module_repo_root>/lcm_geometry_backfill.py`*
 *MCP server: `<openclaw_home>/extensions/geometry-mcp/server.py`*

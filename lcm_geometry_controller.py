@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
 import time
 import threading
+import traceback
 import uuid
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -121,6 +123,9 @@ class GeometryConfig:
     split_hysteresis: int = 3
     split_min_nodes: int = 6
     split_kmeans_max_iter: int = 20
+    split_score_threshold: float = 0.075
+    max_split_enqueues_per_cycle: int = 5
+    split_observability_keep: int = 20000
     tension_threshold: float = 0.70  # CSD above this → TENSIONED state
     beta1_comp: float = 0.50
     beta2_comp: float = 0.30
@@ -327,6 +332,29 @@ CREATE TABLE IF NOT EXISTS maintenance_jobs (
     completed_ts  REAL
 );
 
+CREATE TABLE IF NOT EXISTS maintenance_split_observations (
+    id                    TEXT PRIMARY KEY,
+    run_id                TEXT NOT NULL,
+    branch_id             TEXT NOT NULL,
+    state_before          TEXT,
+    state_after           TEXT,
+    regime                TEXT,
+    node_count            INTEGER,
+    split_score           REAL,
+    split_threshold       REAL,
+    split_counter_before  INTEGER,
+    split_counter_after   INTEGER,
+    split_hysteresis      INTEGER,
+    split_min_nodes       INTEGER,
+    gate_nodes            INTEGER,
+    gate_score            INTEGER,
+    gate_hysteresis       INTEGER,
+    should_split          INTEGER,
+    enqueued              INTEGER,
+    reason                TEXT,
+    created_ts            REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS csd_ema_state (
     branch_id     TEXT NOT NULL,
     ema_key       TEXT NOT NULL,
@@ -342,6 +370,9 @@ CREATE INDEX IF NOT EXISTS idx_edges_dst    ON memory_edges(dst_id);
 CREATE INDEX IF NOT EXISTS idx_edges_type   ON memory_edges(edge_type);
 CREATE INDEX IF NOT EXISTS idx_feedback_branch ON retrieval_feedback(branch_id);
 CREATE INDEX IF NOT EXISTS idx_csd_ema_branch ON csd_ema_state(branch_id);
+CREATE INDEX IF NOT EXISTS idx_split_obs_run ON maintenance_split_observations(run_id);
+CREATE INDEX IF NOT EXISTS idx_split_obs_branch ON maintenance_split_observations(branch_id);
+CREATE INDEX IF NOT EXISTS idx_split_obs_ts ON maintenance_split_observations(created_ts);
 """
 
 
@@ -691,7 +722,7 @@ class SplitScorer:
 
     def should_split(self, s: BranchStats, score: float, cfg: GeometryConfig) -> bool:
         return (
-            score > 0.55
+            score > cfg.split_score_threshold
             and s.split_counter >= cfg.split_hysteresis
         )
 
@@ -950,6 +981,20 @@ class GeometryDB:
             return np.zeros((0, 1)), np.zeros(0)
         return np.array(embs, dtype=np.float32), np.array(weights, dtype=np.float32)
 
+    def branch_node_count(self, branch_id: str, require_embedding: bool = True) -> int:
+        if require_embedding:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM memory_nodes "
+                "WHERE branch_id=? AND embedding IS NOT NULL AND length(embedding) > 2",
+                (branch_id,),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM memory_nodes WHERE branch_id=?",
+                (branch_id,),
+            ).fetchone()
+        return int(row["c"] or 0) if row else 0
+
     # ---- Edges ----
 
     def add_edge(self, src: str, dst: str, etype: EdgeType, weight: float = 1.0) -> None:
@@ -1176,6 +1221,106 @@ class GeometryDB:
         )
         self.conn.commit()
 
+    # ---- Maintenance split observability ----
+
+    def log_split_observation(
+        self,
+        *,
+        run_id: str,
+        branch_id: str,
+        state_before: str,
+        state_after: str,
+        regime: str,
+        node_count: int,
+        split_score: float,
+        split_threshold: float,
+        split_counter_before: int,
+        split_counter_after: int,
+        split_hysteresis: int,
+        split_min_nodes: int,
+        gate_nodes: bool,
+        gate_score: bool,
+        gate_hysteresis: bool,
+        should_split: bool,
+        enqueued: bool,
+        reason: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO maintenance_split_observations
+                (id, run_id, branch_id,
+                 state_before, state_after, regime, node_count,
+                 split_score, split_threshold,
+                 split_counter_before, split_counter_after,
+                 split_hysteresis, split_min_nodes,
+                 gate_nodes, gate_score, gate_hysteresis,
+                 should_split, enqueued, reason, created_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                run_id,
+                branch_id,
+                state_before,
+                state_after,
+                regime,
+                int(node_count),
+                float(split_score),
+                float(split_threshold),
+                int(split_counter_before),
+                int(split_counter_after),
+                int(split_hysteresis),
+                int(split_min_nodes),
+                int(bool(gate_nodes)),
+                int(bool(gate_score)),
+                int(bool(gate_hysteresis)),
+                int(bool(should_split)),
+                int(bool(enqueued)),
+                reason,
+                time.time(),
+            ),
+        )
+        self.conn.commit()
+
+    def list_split_observations(
+        self,
+        limit: int = 200,
+        run_id: Optional[str] = None,
+        branch_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        lim = max(1, int(limit))
+        where: list[str] = []
+        params: list[Any] = []
+        if run_id:
+            where.append("run_id=?")
+            params.append(run_id)
+        if branch_id:
+            where.append("branch_id=?")
+            params.append(branch_id)
+        q = "SELECT * FROM maintenance_split_observations"
+        if where:
+            q += " WHERE " + " AND ".join(where)
+        q += " ORDER BY created_ts DESC LIMIT ?"
+        params.append(lim)
+        rows = self.conn.execute(q, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
+    def prune_split_observations(self, keep_max: int = 20000) -> int:
+        safe_keep = max(100, int(keep_max))
+        cur = self.conn.execute(
+            """
+            DELETE FROM maintenance_split_observations
+            WHERE id IN (
+                SELECT id FROM maintenance_split_observations
+                ORDER BY created_ts DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (safe_keep,),
+        )
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
 
 # ---------------------------------------------------------------------------
 # Geometry Controller  (main public API)
@@ -1236,6 +1381,7 @@ class GeometryController:
         token_count:      int            = 0,
         conflict_score:   float          = 0.0,
         active_branch_id: Optional[str] = None,
+        force_branch_id:  Optional[str] = None,
         parent_lcm_id:    Optional[str] = None,
         text:             Optional[str] = None,   # alternative to embedding
     ) -> AllocationDecision:
@@ -1267,29 +1413,37 @@ class GeometryController:
             )
         else:
             emb = np.zeros(self.cfg.embedding_dim, dtype=np.float32)
-        candidates = self._get_candidate_branches(active_branch_id)
 
-        best_branch: Optional[BranchStats] = None
-        best_csd    = float("inf")
-
-        for stats in candidates:
-            s = self.csd.score(emb, stats, conflict=conflict_score)
-            if s < best_csd:
-                best_csd    = s
-                best_branch = stats
-
-        # Determine action
-        if best_branch is None:
-            action    = "fork"
-            branch_id = self._create_branch(node_type)
-        else:
-            action    = self.csd.decide(best_csd, self.cfg)
+        forced_branch = bool(force_branch_id)
+        if forced_branch:
+            best_branch = self._ensure_branch(str(force_branch_id), node_type)
+            best_csd = 0.0
+            action = "attach"
             branch_id = best_branch.branch_id
+        else:
+            candidates = self._get_candidate_branches(active_branch_id)
 
-            if action == "fork":
-                branch_id = self._create_branch(node_type, near=best_branch.branch_id)
-            elif action == "attach_tension":
-                self._set_branch_state(best_branch.branch_id, BranchState.TENSIONED)
+            best_branch: Optional[BranchStats] = None
+            best_csd    = float("inf")
+
+            for stats in candidates:
+                s = self.csd.score(emb, stats, conflict=conflict_score)
+                if s < best_csd:
+                    best_csd    = s
+                    best_branch = stats
+
+            # Determine action
+            if best_branch is None:
+                action    = "fork"
+                branch_id = self._create_branch(node_type)
+            else:
+                action    = self.csd.decide(best_csd, self.cfg)
+                branch_id = best_branch.branch_id
+
+                if action == "fork":
+                    branch_id = self._create_branch(node_type, near=best_branch.branch_id)
+                elif action == "attach_tension":
+                    self._set_branch_state(best_branch.branch_id, BranchState.TENSIONED)
         # Persist node
         parent_node_id = self.db.find_node_id_by_lcm_id(parent_lcm_id) if parent_lcm_id else None
         prev_node_id = self.db.get_last_node_id(branch_id)
@@ -1321,11 +1475,16 @@ class GeometryController:
         if updated:
             self._update_branch_geometry(updated, emb)
 
-        rationale = (
-
-            f"CSD={best_csd:.3f} → {action}; "
-            f"conflict={conflict_score:.2f}; branch={branch_id}"
-        )
+        if forced_branch:
+            rationale = (
+                f"forced_branch_lock={branch_id}; "
+                f"conflict={conflict_score:.2f}; branch={branch_id}"
+            )
+        else:
+            rationale = (
+                f"CSD={best_csd:.3f} -> {action}; "
+                f"conflict={conflict_score:.2f}; branch={branch_id}"
+            )
 
         return AllocationDecision(
             action         = action,
@@ -1424,7 +1583,7 @@ class GeometryController:
     # 5. Maintenance cycle (run periodically or via background LLM-Map)
     # ------------------------------------------------------------------
 
-    def run_maintenance_cycle(self) -> dict[str, int]:
+    def run_maintenance_cycle(self) -> dict[str, Any]:
         """
         Runs offline maintenance:
           - geometry recompute
@@ -1439,7 +1598,16 @@ class GeometryController:
             "split_executed": 0,
             "merge_candidates": 0,
             "reactivated": 0,
+            "split_observations": 0,
         }
+        split_run_id = str(uuid.uuid4())
+        actions["split_trace_run_id"] = split_run_id
+        split_threshold = float(self.cfg.split_score_threshold)
+        min_split_nodes = max(2, int(self.cfg.split_min_nodes))
+        split_readiness_nodes = max(min_split_nodes, int(self.cfg.min_branch_size))
+        split_enqueue_cap = max(0, int(self.cfg.max_split_enqueues_per_cycle))
+        split_candidates: list[dict[str, Any]] = []
+        split_observations: list[dict[str, Any]] = []
 
         all_stats = self.db.all_branches()
 
@@ -1483,27 +1651,137 @@ class GeometryController:
                 self.db.upsert_branch(s)
                 actions["recomputed"] += 1
 
+            split_counter_before = int(s.split_counter)
+            state_before = s.state.value
+            gate_nodes = bool(s.node_count >= split_readiness_nodes)
+            real_node_count = self.db.branch_node_count(s.branch_id, require_embedding=True)
+            gate_real_nodes = bool(real_node_count >= split_readiness_nodes)
+
             split_s = self.splitter.score(s)
-            if split_s > 0.55:
+            gate_score = bool(split_s > split_threshold)
+            counter_reset_for_nodes = False
+            if not gate_nodes or not gate_real_nodes:
+                # Do not accumulate split hysteresis on branches that are below
+                # either split-size gate (state node_count or real node rows).
+                counter_reset_for_nodes = bool(s.split_counter != 0)
+                s.split_counter = 0
+            elif gate_score:
                 s.split_counter += 1
             else:
                 s.split_counter = max(0, s.split_counter - 1)
 
-            min_split_nodes = max(2, int(self.cfg.split_min_nodes))
-            should_split_now = (
-                s.node_count >= min_split_nodes
+            gate_hysteresis = bool(s.split_counter >= self.cfg.split_hysteresis)
+            should_split_now = bool(
+                gate_nodes
+                and gate_real_nodes
                 and self.splitter.should_split(s, split_s, self.cfg)
             )
+            pending_split_exists = bool(self.db.has_pending_job("split", s.branch_id))
+            enqueued = False
+            reason_parts: list[str] = []
+            if not gate_nodes:
+                reason_parts.append(f"nodes_below_min:{s.node_count}<{split_readiness_nodes}")
+            if not gate_real_nodes:
+                reason_parts.append(f"real_nodes_below_min:{real_node_count}<{split_readiness_nodes}")
+            if counter_reset_for_nodes:
+                reason_parts.append("counter_reset_for_nodes_gate")
+            if not gate_score:
+                reason_parts.append(f"score_below_threshold:{split_s:.4f}<={split_threshold:.4f}")
+            if gate_score and gate_nodes and gate_real_nodes and not gate_hysteresis:
+                reason_parts.append(
+                    f"hysteresis_not_met:{s.split_counter}<{int(self.cfg.split_hysteresis)}"
+                )
             if should_split_now:
-                s.state = BranchState.SPLIT_PENDING
-                if not self.db.has_pending_job("split", s.branch_id):
-                    self.db.enqueue_job(
-                        "split",
-                        target_id=s.branch_id,
-                        payload={"split_score": float(split_s)},
-                    )
-                    actions["split_pending"] += 1
+                if pending_split_exists:
+                    s.state = BranchState.SPLIT_PENDING
+                    reason_parts.append("eligible_pending_exists")
+                else:
+                    reason_parts.append("eligible_candidate")
+            elif not reason_parts:
+                reason_parts.append("not_eligible")
+
+            split_obs = {
+                "run_id": split_run_id,
+                "branch_id": s.branch_id,
+                "state_before": state_before,
+                "state_after": s.state.value,
+                "regime": s.regime.value,
+                "node_count": int(s.node_count),
+                "split_score": float(split_s),
+                "split_threshold": split_threshold,
+                "split_counter_before": split_counter_before,
+                "split_counter_after": int(s.split_counter),
+                "split_hysteresis": int(self.cfg.split_hysteresis),
+                "split_min_nodes": split_readiness_nodes,
+                "gate_nodes": gate_nodes,
+                "gate_score": gate_score,
+                "gate_hysteresis": gate_hysteresis,
+                "should_split": should_split_now,
+                "enqueued": enqueued,
+                "reason_parts": reason_parts,
+            }
+            split_observations.append(split_obs)
+            if should_split_now and not pending_split_exists:
+                split_candidates.append(
+                    {
+                        "branch_id": s.branch_id,
+                        "split_score": float(split_s),
+                        "stats": s,
+                        "obs": split_obs,
+                    }
+                )
             self.db.upsert_branch(s)
+
+        if split_candidates:
+            split_candidates.sort(key=lambda item: float(item["split_score"]), reverse=True)
+            for rank, cand in enumerate(split_candidates, start=1):
+                branch_stats: BranchStats = cand["stats"]
+                obs: dict[str, Any] = cand["obs"]
+                reason_parts: list[str] = obs["reason_parts"]
+                allowed_by_cap = bool(split_enqueue_cap > 0 and rank <= split_enqueue_cap)
+                if allowed_by_cap:
+                    if self.db.has_pending_job("split", branch_stats.branch_id):
+                        branch_stats.state = BranchState.SPLIT_PENDING
+                        reason_parts.append("eligible_pending_exists_late")
+                    else:
+                        self.db.enqueue_job(
+                            "split",
+                            target_id=branch_stats.branch_id,
+                            payload={"split_score": float(cand["split_score"])},
+                        )
+                        actions["split_pending"] += 1
+                        obs["enqueued"] = True
+                        reason_parts.append(f"eligible_enqueued_rank:{rank}")
+                        branch_stats.state = BranchState.SPLIT_PENDING
+                else:
+                    reason_parts.append(
+                        f"eligible_throttled_rank:{rank}>cap:{int(split_enqueue_cap)}"
+                    )
+                obs["state_after"] = branch_stats.state.value
+                self.db.upsert_branch(branch_stats)
+
+        for obs in split_observations:
+            self.db.log_split_observation(
+                run_id=obs["run_id"],
+                branch_id=obs["branch_id"],
+                state_before=obs["state_before"],
+                state_after=obs["state_after"],
+                regime=obs["regime"],
+                node_count=int(obs["node_count"]),
+                split_score=float(obs["split_score"]),
+                split_threshold=float(obs["split_threshold"]),
+                split_counter_before=int(obs["split_counter_before"]),
+                split_counter_after=int(obs["split_counter_after"]),
+                split_hysteresis=int(obs["split_hysteresis"]),
+                split_min_nodes=int(obs["split_min_nodes"]),
+                gate_nodes=bool(obs["gate_nodes"]),
+                gate_score=bool(obs["gate_score"]),
+                gate_hysteresis=bool(obs["gate_hysteresis"]),
+                should_split=bool(obs["should_split"]),
+                enqueued=bool(obs["enqueued"]),
+                reason=";".join(obs["reason_parts"]),
+            )
+            actions["split_observations"] += 1
 
         stable = [
             s for s in self.db.all_branches()
@@ -1550,6 +1828,7 @@ class GeometryController:
                 actions["reactivated"] += 1
 
         actions["split_executed"] = self.execute_pending_splits(max_jobs=10)
+        self.db.prune_split_observations(self.cfg.split_observability_keep)
         return actions
 
     # ------------------------------------------------------------------
@@ -1566,6 +1845,15 @@ class GeometryController:
         s = BranchStats(branch_id=bid, branch_type=btype)
         self.db.upsert_branch(s)
         return bid
+
+    def _ensure_branch(self, branch_id: str, node_type: NodeType) -> BranchStats:
+        existing = self.db.load_branch(branch_id)
+        if existing:
+            return existing
+        btype = self._infer_branch_type(node_type)
+        s = BranchStats(branch_id=branch_id, branch_type=btype)
+        self.db.upsert_branch(s)
+        return s
 
     def _next_conv_branch_id(self) -> str:
         return self.db.next_conv_branch_id()
@@ -2000,6 +2288,39 @@ class GeometryController:
     def pending_maintenance(self) -> list[dict]:
         return self.db.pending_jobs()
 
+    def split_observations(
+        self,
+        limit: int = 200,
+        run_id: Optional[str] = None,
+        branch_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        return self.db.list_split_observations(limit=limit, run_id=run_id, branch_id=branch_id)
+
+    def _default_backfill_error_log_path(self) -> str:
+        base = os.path.dirname(self.db.db_path) or "."
+        return os.path.join(base, "backfill_errors.log")
+
+    def _append_backfill_error(
+        self,
+        log_path: str,
+        *,
+        conv_id: int,
+        branch_id: str,
+        message_count: int,
+        exc: Exception,
+    ) -> None:
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        stack = traceback.format_exc().strip()
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(
+                f"[{ts}] conv_id={conv_id} branch_id={branch_id} "
+                f"messages={message_count} error={type(exc).__name__}: {exc}\n"
+            )
+            if stack:
+                fh.write(stack + "\n")
+            fh.write("---\n")
+
     # ------------------------------------------------------------------
     # Fix 3 — Incremental backfill from LCM (resume-safe)
     # ------------------------------------------------------------------
@@ -2010,6 +2331,7 @@ class GeometryController:
         max_per_conv: int = 200,
         resume:       bool = True,
         progress_cb = None,   # Optional[Callable[[int,int], None]]
+        error_log_path: Optional[str] = None,
     ) -> dict[str, int]:
         """
         Batch-import all conversations from an LCM database into the geometry DB.
@@ -2020,7 +2342,7 @@ class GeometryController:
         Requires self.embedding_provider to be set (pass to GeometryController).
 
         Returns:
-            {"processed": N, "skipped": M, "failed": 0, "sampled": K}
+            {"processed": N, "skipped": M, "failed": F, "sampled": K, "errors_logged": E}
         """
         lcm = sqlite3.connect(lcm_db_path)
         lcm.row_factory = sqlite3.Row
@@ -2043,7 +2365,8 @@ class GeometryController:
         )
 
         total = len(convs)
-        stats = {"processed": 0, "skipped": 0, "failed": 0, "sampled": 0}
+        stats = {"processed": 0, "skipped": 0, "failed": 0, "sampled": 0, "errors_logged": 0}
+        error_log = error_log_path or self._default_backfill_error_log_path()
 
         for i, (cid, msgs) in enumerate(convs.items()):
             branch_id = f"conv_{cid}"
@@ -2078,13 +2401,21 @@ class GeometryController:
                         embedding=emb,
                         role=msg["role"] or "user",
                         token_count=msg["token_count"] or 0,
-                        active_branch_id=branch_id,
+                        force_branch_id=branch_id,
                     )
                 stats["processed"] += 1
                 if progress_cb:
                     progress_cb(i + 1, total)
-            except Exception:
+            except Exception as exc:
                 stats["failed"] += 1
+                self._append_backfill_error(
+                    error_log,
+                    conv_id=int(cid),
+                    branch_id=branch_id,
+                    message_count=len(msgs),
+                    exc=exc,
+                )
+                stats["errors_logged"] += 1
 
         lcm.close()
         return stats
