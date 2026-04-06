@@ -1,10 +1,10 @@
 # LCM Geometry Controller — Manual
 
-**Version:** 1.0
+**Version:** 1.2
 **Module:** `lcm_geometry_controller.py`
 **Geometry DB:** `<openclaw_home>/lcm_geometry.db`
 **LCM DB:** `<openclaw_home>/lcm.db`
-**Last Updated:** 2026-04-05
+**Last Updated:** 2026-04-06
 
 ---
 
@@ -22,8 +22,8 @@
 10. [Backfill — One-Time Setup](#10-backfill--one-time-setup)
 11. [DAG Edge Import](#11-dag-edge-import)
 12. [MCP Server Tools](#12-mcp-server-tools)
-13. [All 5 Fixes Applied](#13-all-5-fixes-applied)
-14. [Pending Integrations](#14-pending-integrations)
+13. [Current Enhancements](#13-current-enhancements)
+14. [Integration Status](#14-integration-status)
 15. [Troubleshooting](#15-troubleshooting)
 
 ---
@@ -219,7 +219,7 @@ gc = GeometryController('/path/to/lcm_geometry.db', cfg=GeometryConfig())
 gc = GeometryController('/path/to/lcm_geometry.db', embedding_provider=EmbeddingProvider())
 ```
 
-### `gc.on_new_item(lcm_id, node_type, text=None, embedding=None, role='', token_count=0, parent_id=None)`
+### `gc.on_new_item(lcm_id, node_type, embedding=None, role='user', token_count=0, conflict_score=0.0, active_branch_id=None, parent_lcm_id=None, text=None)`
 
 Called after LCM persists a new message/summary. Computes CSD score against all active branches, decides where to attach.
 
@@ -229,7 +229,9 @@ Called after LCM persists a new message/summary. Computes CSD score against all 
 - **`embedding`** — pre-computed 384-dim vector (if not using `text=`)
 - **`role`** — message role: `user`, `assistant`, `system`
 - **`token_count`** — approximate token count
-- **`parent_id`** — parent node ID for DAG construction
+- **`conflict_score`** - optional conflict severity signal for CSD scoring
+- **`active_branch_id`** - preferred branch hint from caller runtime
+- **`parent_lcm_id`** - parent LCM id; controller resolves parent node and links DAG/temporal edges
 
 **Returns:** `AllocationDecision` with fields:
 - `action` — `"attach"`, `"attach_tension"`, or `"fork"`
@@ -280,18 +282,22 @@ r = gc.branch_report('conv_1')
 Full maintenance sweep over all branches. Should be run periodically (every 20–30 min).
 
 **Operations per branch:**
-1. Recompute geometry from `memory_nodes` if `node_count >= min_branch_size`
-2. Fallback: reclassify regime from stored scalar metrics if `mean_vec` exists
-3. Scan for splits (high split score → increment `split_counter`)
-4. Scan for merges (stable branches with high overlap → increment `merge_counter`)
-5. Apply regime transitions
+1. **Recomputes geometry** for each branch from its `memory_nodes` rows
+2. **Refreshes contradiction signals** (density + bounded `CONTRADICTS` edges)
+3. **Reclassifies regime** - PRODUCTIVE / RIGID / UNSTABLE
+4. **Scans for splits and queues jobs** when hysteresis conditions are met
+5. **Scores merges with runtime signals** (graph overlap + retrieval co-use)
+6. **Executes pending split jobs** (k-means(2), child branches, `REFINES` edges)
+7. **Runs reactivation scan**
 
 **Returns:** `dict` with counts:
 ```python
 {
-    'recomputed': 437,     # branches recomputed from memory_nodes
-    'split_pending': 0,   # branches flagged for split
-    'merge_candidates': 0 # branch pairs flagged for merge
+    'recomputed': 437,
+    'split_pending': 0,
+    'split_executed': 0,
+    'merge_candidates': 0,
+    'reactivated': 0
 }
 ```
 
@@ -594,84 +600,49 @@ openclaw gateway restart
 
 ---
 
-## 13. All 5 Fixes Applied
+## 13. Current Enhancements
 
-These fixes were applied on 2026-04-04 to the module at `<module_repo_root>/lcm_geometry_controller.py`.
+The current controller build includes these production features:
 
-### Fix 1 — EmbeddingProvider (New Feature)
-
-**What:** Added `EmbeddingProvider` class — pluggable embedding backend with lazy model loading, in-memory cache, `embed()` and `embed_batch()` methods.
-
-**Integration:** Passed to `GeometryController(embedding_provider=EmbeddingProvider())`. `on_new_item()` now accepts `text=` directly — auto-embeds via provider.
-
-**Benefit:** No need for caller to pre-compute embeddings. First call to `embed()` loads the sentence-transformers model. Repeated calls use cache.
-
-### Fix 2 — CSD `inf` on First Insert (Bug Fix)
-
-**Bug:** `_residual()` used `hasattr(self.cfg, "EPS")` which was always `False` (GeometryConfig has no EPS attribute). First message in any branch got `csd=inf`.
-
-**Fix:** Residual denominator is floor-clamped (`expected = max(expected, 1e-6)`), which prevents divide-by-zero behavior on first inserts and keeps CSD finite.
-
-**Result:** First-insert CSD = 0.0 (finite, correct — new branch is always a valid attachment target).
-
-### Fix 3 — backfill_from_lcm() with Resume (New Feature)
-
-**What:** Added `backfill_from_lcm()` method on `GeometryController` with resume support, stratified sampling for large conversations (>200 msgs), and progress callback.
-
-**Benefit:** Full backfill takes ~25 min for 437 conversations. Incremental resume skips already-done branches and processes only new ones.
-
-### Fix 4 — DAG Edge Import (New Feature)
-
-**What:** Added `import_dag_edges_from_lcm()` — reads `summary_parents` and `summary_messages` from `lcm.db`, populates `memory_edges` table.
-
-**Result:** 435 `DERIVED_FROM` edges + 16,021 `SUMMARIZES` edges imported. Merge/split scorers can now compute `topic_overlap` and `retrieval_co_use`.
-
-### Fix 5 — Maintenance Fallback (Bug Fix)
-
-**Bug:** `run_maintenance_cycle()` only recomputed branches with ≥8 `memory_nodes` rows. After backfill, most branches had 0–2 rows → silently skipped. Only 16/437 branches were recomputed.
-
-**Fix:** Added `elif s.mean_vec:` fallback that recomputes regime from stored scalar metrics (eff_rank, anisotropy, coherence, compression_loss) even when no memory_nodes rows exist.
-
-**Result:** All 437/437 branches recomputed on each maintenance cycle.
+1. **Incremental ingest API** via `poll_lcm_for_new_items(...)` using rowid cursors.
+2. **Parent-aware insertion** in `on_new_item(...)` with `parent_lcm_id` resolution.
+3. **Automatic `TEMPORAL_NEXT` edge creation** between consecutive nodes in the same branch.
+4. **Contradiction refresh** in maintenance:
+   - contradiction density recomputation per branch
+   - bounded `CONTRADICTS` edge regeneration
+5. **Merge runtime signals** integrated into merge scoring:
+   - graph overlap from memory edges
+   - retrieval co-use from feedback history
+6. **Split execution pipeline**:
+   - pending split jobs consumed by `execute_pending_splits(...)`
+   - internal k-means(2) partition
+   - child branch creation + `REFINES` edges
+7. **Operational observability APIs**:
+   - `health_report()`
+   - `mark_branch_agent_interest(...)`
+   - `add_cross_agent_shared_edge(...)`
+   - `list_cross_agent_links(...)`
+8. **Persisted CSD EMA state** (`csd_ema_state`) and retrieval history consistency updates.
 
 ---
 
-## 14. Pending Integrations
+## 14. Integration Status
 
-These items are designed but not yet wired into OpenClaw's runtime.
+### Implemented
 
-### 🔜 Real-Time LCM Polling
+- Incremental LCM polling API exists in controller (`poll_lcm_for_new_items`).
+- Maintenance covers contradiction refresh, merge signal scoring, split queueing, and split execution.
+- Cross-agent edge APIs are available and persisted in geometry DB.
 
-**Goal:** When Victor chats and new messages get added to `lcm.db`, the geometry controller should automatically process them via `gc.on_new_item()`.
+### Optional runtime wiring (deployment choice)
 
-**What's needed:** A background loop that polls `lcm.db` every ~30 seconds for new rows in `messages` table since last check, calls `gc.on_new_item()` for each, and commits to `lcm_geometry.db`.
-
-**Integration point:** OpenClaw agent heartbeat or a dedicated cron process.
-
-### 🔜 Maintenance Cron Job
-
-**Goal:** Keep branch states current by running `gc.run_maintenance_cycle()` every 20–30 minutes.
-
-**What's needed:** A cron entry or OpenClaw heartbeat that calls `gc.run_maintenance_cycle()` and logs results.
-
-**Priority:** Medium — without it, regime classifications may drift stale.
-
-### 🔜 Retrieval Feedback Loop
-
-**Goal:** When Victor (or the agent) retrieves a conversation branch and acts on it, record that signal in `retrieval_feedback` table. The `RetrievalRanker` should then boost frequently-useful branches.
-
-**What's needed:** After any `hybrid_search` call that results in Victor engaging with a conversation, write a feedback row. The `rank_retrieval()` method already accepts `historical_use=` and `same_project=` parameters.
-
-### 🔜 on_new_item() → LCM Event Hook
-
-**Goal:** `gc.on_new_item()` should be called by LCM's own persistence layer when it writes a new message, not just by a polling loop.
-
-**What's needed:** Integration into `lossless-claw` plugin (LCM plugin) to call the geometry controller after persisting each message. This would require the LCM plugin to import the geometry module and call `on_new_item()` with the new message's data.
+- Schedule periodic `run_maintenance_cycle()` (cron/heartbeat).
+- Run polling loop using `poll_lcm_for_new_items(...)` with a persisted cursor.
+- Feed retrieval/usefulness feedback regularly for stronger merge co-use signal quality.
 
 ---
 
 ## 15. Troubleshooting
-
 ### Module won't import
 
 ```

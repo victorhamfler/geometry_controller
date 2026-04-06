@@ -1,6 +1,25 @@
-# LCM Geometry Controller + MCP Server
+﻿# LCM Geometry Controller + MCP Server
 
 Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geometry-aware tools.
+
+## Latest Update (2026-04-06)
+
+- Added incremental ingest API: `poll_lcm_for_new_items(...)` for rowid-cursor polling from `lcm.db`.
+- `on_new_item(...)` now supports `parent_lcm_id`, resolves parent linkage, and writes `TEMPORAL_NEXT` edges.
+- Added contradiction refresh in maintenance:
+  - branch contradiction density recomputed from embeddings
+  - `CONTRADICTS` edges refreshed (bounded by config)
+- Merge scoring now uses real runtime signals:
+  - graph overlap via memory edges
+  - retrieval co-use from feedback history
+- Added split execution path:
+  - pending split jobs are executed with internal k-means(2)
+  - child branches are created and linked with `REFINES` edges
+- Added operations APIs:
+  - `health_report()`
+  - `mark_branch_agent_interest(...)`
+  - `add_cross_agent_shared_edge(...)`
+  - `list_cross_agent_links(...)`
 
 ## What is included
 

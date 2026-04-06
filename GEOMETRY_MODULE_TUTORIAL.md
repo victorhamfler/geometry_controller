@@ -1,8 +1,8 @@
-# LCM Geometry Module - User and Agent Tutorial
+﻿# LCM Geometry Module - User and Agent Tutorial
 
-**Version:** 1.1  
-**Module:** `lcm_geometry_controller.py`  
-**Last Updated:** 2026-04-05
+**Version:** 1.2
+**Module:** `lcm_geometry_controller.py`
+**Last Updated:** 2026-04-06
 
 This tutorial explains how to use the geometry module as a semantic companion to OpenClaw LCM.
 
@@ -65,6 +65,9 @@ Recommended flow: `hybrid_search` -> `branch_report` (if needed) -> `conversatio
 | `tension_threshold` | `0.70` | CSD in `[attach_threshold, tension_threshold)` -> `attach_tension`; above -> `fork` |
 | `alpha_sem` | `0.60` | Semantic weight in retrieval ranking |
 | `beta_trust` | `0.25` | Trust/quality weight in retrieval ranking |
+| `split_min_nodes` | `6` | Minimum nodes before split execution is allowed |
+| `merge_signal_lookback` | `5000` | Retrieval co-use lookback rows for merge scoring |
+| `contradiction_sim_threshold` | `-0.30` | Cosine threshold used to detect contradiction pairs |
 
 ---
 
@@ -100,14 +103,31 @@ db_path = os.path.expanduser('~/.openclaw/lcm_geometry.db')
 
 ---
 
-## 7. Operating tips
+## 7. Incremental ingest loop
+
+Use `poll_lcm_for_new_items(...)` for real-time style ingestion without full backfill:
+
+```python
+cursor = 0
+while True:
+    r = gc.poll_lcm_for_new_items('<openclaw_home>/lcm.db', since_rowid=cursor, limit=200)
+    cursor = r['next_rowid']
+    # sleep or schedule externally
+```
+
+This preserves a rowid cursor and processes only new messages.
+
+---
+
+## 8. Operating tips
 
 - Run `run_maintenance_cycle()` periodically (for example every 20-30 minutes).
 - Use `resume=True` for incremental backfill runs.
+- Use `gc.health_report()` for quick state/regime and pending-job visibility.
 - Keep this tutorial aligned with `GEOMETRY_CONTROLLER_MANUAL.md` when behavior changes.
 
 ---
 
-## 8. Summary
+## 9. Summary
 
 The geometry module improves memory retrieval quality by adding semantic structure on top of LCM history. It complements LCM; it does not replace it.

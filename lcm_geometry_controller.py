@@ -112,12 +112,15 @@ class GeometryConfig:
     beta_trust:  float = 0.25
     delta_react: float = 0.15
     kappa_coherence:     float = 0.30
+    kappa_hist:          float = 0.20
     kappa_comp_loss:     float = 0.20
     kappa_contradiction: float = 0.25
     kappa_ret_error:     float = 0.25
 
     # ── Split scorer ───────────────────────────────────────────────────────
     split_hysteresis: int = 3
+    split_min_nodes: int = 6
+    split_kmeans_max_iter: int = 20
     tension_threshold: float = 0.70  # CSD above this → TENSIONED state
     beta1_comp: float = 0.50
     beta2_comp: float = 0.30
@@ -161,6 +164,9 @@ class GeometryConfig:
 
     # ── Usefulness tracker ─────────────────────────────────────────────────
     usefulness_lambda: float = 0.10
+    contradiction_sim_threshold: float = -0.30
+    contradiction_edge_max_pairs: int = 256
+    merge_signal_lookback: int = 5000
 
     # ── Initial state ──────────────────────────────────────────────────────
     initial_state: BranchState = BranchState.FORMING
@@ -321,10 +327,21 @@ CREATE TABLE IF NOT EXISTS maintenance_jobs (
     completed_ts  REAL
 );
 
+CREATE TABLE IF NOT EXISTS csd_ema_state (
+    branch_id     TEXT NOT NULL,
+    ema_key       TEXT NOT NULL,
+    value         REAL NOT NULL,
+    updated_ts    REAL NOT NULL,
+    PRIMARY KEY (branch_id, ema_key)
+);
+
 CREATE INDEX IF NOT EXISTS idx_nodes_branch ON memory_nodes(branch_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_lcm    ON memory_nodes(lcm_id);
 CREATE INDEX IF NOT EXISTS idx_edges_src    ON memory_edges(src_id);
+CREATE INDEX IF NOT EXISTS idx_edges_dst    ON memory_edges(dst_id);
+CREATE INDEX IF NOT EXISTS idx_edges_type   ON memory_edges(edge_type);
 CREATE INDEX IF NOT EXISTS idx_feedback_branch ON retrieval_feedback(branch_id);
+CREATE INDEX IF NOT EXISTS idx_csd_ema_branch ON csd_ema_state(branch_id);
 """
 
 
@@ -510,24 +527,35 @@ class CSDScorer:
     CSD(x→B) = γ1·Rμ + γ2·Rr + γ3·RA + γ4·Rτ + γ5·(1-cos(ex,μB)) + γ6·conflict
     """
 
-    def __init__(self, cfg: GeometryConfig):
+    def __init__(self, cfg: GeometryConfig, db: Optional["GeometryDB"] = None):
         self.cfg = cfg
-        # Per-branch EMA of historical deformations (in-memory only; reset on restart)
+        self.db = db
+        # Per-branch EMA cache; persisted via GeometryDB when available.
         self._history: dict[str, dict[str, float]] = {}
 
     def _get_ema(self, branch_id: str, key: str) -> float:
-        return self._history.get(branch_id, {}).get(key, 0.0)
+        cached = self._history.get(branch_id, {}).get(key)
+        if cached is not None:
+            return cached
+        if self.db is not None:
+            stored = self.db.get_csd_ema(branch_id, key)
+            if stored is not None:
+                self._history.setdefault(branch_id, {})[key] = stored
+                return stored
+        return 0.0
 
     def _update_ema(self, branch_id: str, key: str, value: float) -> None:
-        if branch_id not in self._history:
-            self._history[branch_id] = {}
-        prev = self._history[branch_id].get(key, value)
-        self._history[branch_id][key] = (1 - self.cfg.stat_rho) * prev + self.cfg.stat_rho * value
+        prev = self._get_ema(branch_id, key)
+        if prev <= 0.0:
+            updated = float(value)
+        else:
+            updated = (1 - self.cfg.stat_rho) * prev + self.cfg.stat_rho * value
+        self._history.setdefault(branch_id, {})[key] = updated
+        if self.db is not None:
+            self.db.set_csd_ema(branch_id, key, float(updated))
 
     def _residual(self, delta: float, branch_id: str, key: str) -> float:
-        expected = self._get_ema(branch_id, key) + self.cfg.EPS if hasattr(self.cfg, "EPS") else delta + 1e-9
-        # fallback: use small constant to avoid div-by-zero on first call
-        expected = max(expected, 1e-6)
+        expected = max(self._get_ema(branch_id, key) + GeometryMath.EPS, GeometryMath.EPS)
         return delta / expected
 
     # Public surface
@@ -701,7 +729,7 @@ class RetrievalRanker:
             proj  = (same_project  or {}).get(s.branch_id, 0.0)
             react = (
                 0.5 * sem
-                + c.kappa_coherence * hist     # reuse kappa slot
+                + c.kappa_hist * hist
                 + 0.3 * proj
             )
 
@@ -856,6 +884,31 @@ class GeometryDB:
         rows = self.conn.execute("SELECT branch_id FROM branch_states").fetchall()
         return [self.load_branch(r["branch_id"]) for r in rows]  # type: ignore
 
+    def get_csd_ema(self, branch_id: str, ema_key: str) -> Optional[float]:
+        row = self.conn.execute(
+            "SELECT value FROM csd_ema_state WHERE branch_id=? AND ema_key=?",
+            (branch_id, ema_key),
+        ).fetchone()
+        if row is None:
+            return None
+        return float(row["value"])
+
+    def set_csd_ema(self, branch_id: str, ema_key: str, value: float) -> None:
+        self.conn.execute(
+            "INSERT INTO csd_ema_state (branch_id, ema_key, value, updated_ts) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(branch_id, ema_key) DO UPDATE SET value=excluded.value, updated_ts=excluded.updated_ts",
+            (branch_id, ema_key, float(value), time.time()),
+        )
+        self.conn.commit()
+
+    def next_conv_branch_id(self) -> str:
+        row = self.conn.execute(
+            "SELECT MAX(CAST(SUBSTR(branch_id, 6) AS INTEGER)) AS max_conv "
+            "FROM branch_states WHERE branch_id GLOB 'conv_[0-9]*'"
+        ).fetchone()
+        max_conv = int(row["max_conv"] or 0) if row else 0
+        return f"conv_{max_conv + 1}"
+
     # ---- Nodes ----
 
     def insert_node(self, n: MemoryNode) -> None:
@@ -905,6 +958,144 @@ class GeometryDB:
             VALUES (?, ?, ?, ?)
         """, (src, dst, etype.value, weight))
         self.conn.commit()
+
+    def add_edges_bulk(self, edges: list[tuple[str, str, EdgeType, float]]) -> None:
+        if not edges:
+            return
+        rows = [(src, dst, etype.value if isinstance(etype, EdgeType) else str(etype), float(weight))
+                for src, dst, etype, weight in edges]
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO memory_edges (src_id, dst_id, edge_type, weight) VALUES (?, ?, ?, ?)",
+            rows,
+        )
+        self.conn.commit()
+
+    def find_node_id_by_lcm_id(self, lcm_id: str) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT id FROM memory_nodes WHERE lcm_id=? ORDER BY timestamp DESC LIMIT 1",
+            (lcm_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["id"])
+
+    def get_last_node_id(self, branch_id: str) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT id FROM memory_nodes WHERE branch_id=? ORDER BY timestamp DESC, rowid DESC LIMIT 1",
+            (branch_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["id"])
+
+    def list_branch_nodes(self, branch_id: str, include_embeddings: bool = False) -> list[dict[str, Any]]:
+        cols = "id, lcm_id, branch_id, timestamp, token_count, role"
+        if include_embeddings:
+            cols += ", embedding"
+        rows = self.conn.execute(
+            f"SELECT {cols} FROM memory_nodes WHERE branch_id=? ORDER BY timestamp ASC, rowid ASC",
+            (branch_id,),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            row = dict(r)
+            if include_embeddings:
+                blob = row.get("embedding")
+                row["embedding"] = json.loads(blob.decode()) if blob else []
+            out.append(row)
+        return out
+
+    def reassign_nodes_to_branch(self, node_ids: list[str], branch_id: str) -> int:
+        if not node_ids:
+            return 0
+        self.conn.executemany(
+            "UPDATE memory_nodes SET branch_id=? WHERE id=?",
+            [(branch_id, nid) for nid in node_ids],
+        )
+        self.conn.commit()
+        return len(node_ids)
+
+    def remove_edges_for_nodes(self, node_ids: list[str], edge_type: Optional[EdgeType] = None) -> int:
+        if not node_ids:
+            return 0
+        ph = ",".join(["?"] * len(node_ids))
+        params: list[Any] = []
+        q = f"DELETE FROM memory_edges WHERE src_id IN ({ph}) AND dst_id IN ({ph})"
+        params.extend(node_ids)
+        params.extend(node_ids)
+        if edge_type is not None:
+            q += " AND edge_type=?"
+            params.append(edge_type.value)
+        cur = self.conn.execute(q, tuple(params))
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
+    def edge_counts_between_sets(self, a_ids: set[str], b_ids: set[str]) -> dict[str, int]:
+        if not a_ids or not b_ids:
+            return {}
+        a = sorted(x for x in a_ids if x)
+        b = sorted(x for x in b_ids if x)
+        if not a or not b:
+            return {}
+        pha = ",".join(["?"] * len(a))
+        phb = ",".join(["?"] * len(b))
+        q = (
+            f"SELECT edge_type FROM memory_edges "
+            f"WHERE ((src_id IN ({pha}) AND dst_id IN ({phb})) "
+            f"OR (src_id IN ({phb}) AND dst_id IN ({pha})))"
+        )
+        params = tuple(a + b + b + a)
+        rows = self.conn.execute(q, params).fetchall()
+        out: dict[str, int] = {}
+        for r in rows:
+            et = str(r["edge_type"])
+            out[et] = out.get(et, 0) + 1
+        return out
+
+    def retrieval_co_use_score(self, branch_a: str, branch_b: str, lookback: int = 5000) -> float:
+        lim = max(10, int(lookback))
+        rows = self.conn.execute(
+            "SELECT query_id, branch_id, used FROM retrieval_feedback "
+            "WHERE branch_id IN (?, ?) ORDER BY timestamp DESC LIMIT ?",
+            (branch_a, branch_b, lim),
+        ).fetchall()
+        if not rows:
+            return 0.0
+        grouped: dict[str, dict[str, int]] = {}
+        for r in rows:
+            qid = str(r["query_id"])
+            bid = str(r["branch_id"])
+            used = int(r["used"] or 0)
+            slot = grouped.setdefault(qid, {})
+            slot[bid] = max(slot.get(bid, 0), used)
+        total = len(grouped)
+        both = 0
+        used_quality = 0.0
+        for vals in grouped.values():
+            if branch_a in vals and branch_b in vals:
+                both += 1
+                used_quality += 0.5 * (vals.get(branch_a, 0) + vals.get(branch_b, 0))
+        if total <= 0 or both <= 0:
+            return 0.0
+        both_ratio = both / max(1, total)
+        quality = used_quality / both
+        return float(max(0.0, min(1.0, both_ratio * (0.5 + 0.5 * quality))))
+
+    def list_cross_agent_edges(self, branch_id: Optional[str] = None, limit: int = 200) -> list[dict[str, Any]]:
+        lim = max(1, int(limit))
+        if branch_id:
+            rows = self.conn.execute(
+                "SELECT src_id, dst_id, edge_type, weight FROM memory_edges "
+                "WHERE edge_type=? AND (src_id=? OR dst_id=?) ORDER BY weight DESC LIMIT ?",
+                (EdgeType.CROSS_AGENT.value, branch_id, branch_id, lim),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT src_id, dst_id, edge_type, weight FROM memory_edges "
+                "WHERE edge_type=? ORDER BY weight DESC LIMIT ?",
+                (EdgeType.CROSS_AGENT.value, lim),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ---- Retrieval feedback ----
 
@@ -959,6 +1150,19 @@ class GeometryDB:
         self.conn.commit()
         return jid
 
+    def has_pending_job(self, job_type: str, target_id: Optional[str] = None) -> bool:
+        if target_id is None:
+            row = self.conn.execute(
+                "SELECT 1 FROM maintenance_jobs WHERE status='pending' AND job_type=? LIMIT 1",
+                (job_type,),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT 1 FROM maintenance_jobs WHERE status='pending' AND job_type=? AND target_id=? LIMIT 1",
+                (job_type, target_id),
+            ).fetchone()
+        return row is not None
+
     def pending_jobs(self) -> list[dict]:
         rows = self.conn.execute(
             "SELECT * FROM maintenance_jobs WHERE status='pending' ORDER BY created_ts"
@@ -1010,7 +1214,7 @@ class GeometryController:
     ):
         self.cfg               = cfg or GeometryConfig()
         self.db                = GeometryDB(db_path)
-        self.csd               = CSDScorer(self.cfg)
+        self.csd               = CSDScorer(self.cfg, db=self.db)
         self.merger            = MergeScorer(self.cfg)
         self.splitter          = SplitScorer(self.cfg)
         self.ranker            = RetrievalRanker(self.cfg)
@@ -1086,14 +1290,16 @@ class GeometryController:
                 branch_id = self._create_branch(node_type, near=best_branch.branch_id)
             elif action == "attach_tension":
                 self._set_branch_state(best_branch.branch_id, BranchState.TENSIONED)
-
         # Persist node
+        parent_node_id = self.db.find_node_id_by_lcm_id(parent_lcm_id) if parent_lcm_id else None
+        prev_node_id = self.db.get_last_node_id(branch_id)
+
         node = MemoryNode(
             node_id    = str(uuid.uuid4()),
             lcm_id     = lcm_id,
             node_type  = node_type,
             branch_id  = branch_id,
-            parent_id  = None,   # geometry layer doesn't know LCM parent yet
+            parent_id  = parent_node_id,
             timestamp  = time.time(),
             role       = role,
             token_count = token_count,
@@ -1102,8 +1308,13 @@ class GeometryController:
         )
         self.db.insert_node(node)
 
-        # Add temporal edge from previous node if known
-        # (caller may also call add_temporal_edge directly)
+        # Build temporal chain inside each branch.
+        if prev_node_id and prev_node_id != node.node_id:
+            self.add_temporal_edge(prev_node_id, node.node_id)
+
+        # Optional explicit contradiction hint from caller signal.
+        if parent_node_id and conflict_score > 0.0:
+            self.db.add_edge(parent_node_id, node.node_id, EdgeType.CONTRADICTS, weight=float(conflict_score))
 
         # Adiabatically update branch geometry
         updated = self.db.load_branch(branch_id)
@@ -1111,6 +1322,7 @@ class GeometryController:
             self._update_branch_geometry(updated, emb)
 
         rationale = (
+
             f"CSD={best_csd:.3f} → {action}; "
             f"conflict={conflict_score:.2f}; branch={branch_id}"
         )
@@ -1214,17 +1426,20 @@ class GeometryController:
 
     def run_maintenance_cycle(self) -> dict[str, int]:
         """
-        Runs all offline maintenance jobs:
-          - geometry_recompute
-          - split_scan
-          - merge_scan
-          - reactivation_scan
-          - summary_audit (jobs queued by audit_summary)
-
-        Returns counts of actions taken.
+        Runs offline maintenance:
+          - geometry recompute
+          - contradiction refresh
+          - split/merge scans
+          - split job execution
+          - reactivation scan
         """
-        actions = {"recomputed": 0, "split_pending": 0,
-                   "merge_candidates": 0, "reactivated": 0}
+        actions = {
+            "recomputed": 0,
+            "split_pending": 0,
+            "split_executed": 0,
+            "merge_candidates": 0,
+            "reactivated": 0,
+        }
 
         all_stats = self.db.all_branches()
 
@@ -1232,95 +1447,109 @@ class GeometryController:
             if s is None:
                 continue
 
-            # --- Recompute geometry from stored embeddings ---
             embs, weights = self.db.get_branch_embeddings(s.branch_id)
             if embs.shape[0] >= self.cfg.min_branch_size:
-                mu   = GeometryMath.weighted_mean(embs, weights)
+                mu = GeometryMath.weighted_mean(embs, weights)
                 stats_dict = GeometryMath.compute_full_stats(embs, weights, mu)
-                # Adiabatic update of all geometry fields
                 rho = self.cfg.stat_rho
-                s.mean_vec   = mu.tolist()
-                s.eff_rank   = (1-rho)*s.eff_rank   + rho*stats_dict["eff_rank"]
-                s.trace      = (1-rho)*s.trace      + rho*stats_dict["trace"]
-                s.anisotropy = (1-rho)*s.anisotropy + rho*stats_dict["anisotropy"]
-                s.coherence  = (1-rho)*s.coherence  + rho*stats_dict["coherence"]
-                # anchor
+                s.mean_vec = mu.tolist()
+                s.eff_rank = (1 - rho) * s.eff_rank + rho * stats_dict["eff_rank"]
+                s.trace = (1 - rho) * s.trace + rho * stats_dict["trace"]
+                s.anisotropy = (1 - rho) * s.anisotropy + rho * stats_dict["anisotropy"]
+                s.coherence = (1 - rho) * s.coherence + rho * stats_dict["coherence"]
                 if s.anchor:
-                    a_old  = np.array(s.anchor, dtype=np.float32)
-                    a_new  = (1 - self.cfg.anchor_alpha)*a_old + self.cfg.anchor_alpha*mu
-                    s.anchor       = a_new.tolist()
+                    a_old = np.array(s.anchor, dtype=np.float32)
+                    a_new = (1 - self.cfg.anchor_alpha) * a_old + self.cfg.anchor_alpha * mu
+                    s.anchor = a_new.tolist()
                     s.anchor_drift = float(np.linalg.norm(a_new - a_old))
                 else:
-                    s.anchor       = mu.tolist()
+                    s.anchor = mu.tolist()
                     s.anchor_drift = 0.0
 
                 var = GeometryMath.covariance_diagonal(embs, weights)
                 s.cov_diagonal = var.tolist()
-                s.node_count   = embs.shape[0]
-                s.regime       = self.regime.classify(s)
-
-                # Update lifecycle state based on regime
+                s.node_count = int(embs.shape[0])
+                s.contradiction_density = self._compute_contradiction_signals(s.branch_id)
+                s.regime = self.regime.classify(s)
                 self._update_state_from_regime(s)
                 s.last_update_ts = time.time()
                 self.db.upsert_branch(s)
                 actions["recomputed"] += 1
-
             elif s.mean_vec:
-                # Fallback: reclassify regime from stored scalar metrics.
-                # This runs for branches whose geometry was set at backfill time
-                # but have no (or few) memory_nodes rows — common after backfill.
+                s.contradiction_density = self._compute_contradiction_signals(s.branch_id)
                 s.regime = self.regime.classify(s)
                 self._update_state_from_regime(s)
                 s.last_update_ts = time.time()
                 self.db.upsert_branch(s)
                 actions["recomputed"] += 1
 
-
-            # --- Split scan ---
             split_s = self.splitter.score(s)
             if split_s > 0.55:
                 s.split_counter += 1
             else:
                 s.split_counter = max(0, s.split_counter - 1)
 
-            if self.splitter.should_split(s, split_s, self.cfg):
+            min_split_nodes = max(2, int(self.cfg.split_min_nodes))
+            should_split_now = (
+                s.node_count >= min_split_nodes
+                and self.splitter.should_split(s, split_s, self.cfg)
+            )
+            if should_split_now:
                 s.state = BranchState.SPLIT_PENDING
-                self.db.enqueue_job("split", target_id=s.branch_id,
-                                    payload={"split_score": split_s})
-                actions["split_pending"] += 1
-
+                if not self.db.has_pending_job("split", s.branch_id):
+                    self.db.enqueue_job(
+                        "split",
+                        target_id=s.branch_id,
+                        payload={"split_score": float(split_s)},
+                    )
+                    actions["split_pending"] += 1
             self.db.upsert_branch(s)
 
-        # --- Merge scan (pairwise, O(n²) — only on small/stable set) ---
-        stable = [s for s in all_stats
-                  if s and s.state in (BranchState.STABLE, BranchState.DORMANT)]
+        stable = [
+            s for s in self.db.all_branches()
+            if s and s.state in (BranchState.STABLE, BranchState.DORMANT)
+        ]
         for i, s1 in enumerate(stable):
-            for s2 in stable[i+1:]:
-                ms = self.merger.score(s1, s2)
+            for s2 in stable[i + 1:]:
+                topic_overlap, retrieval_co_use = self._compute_merge_signals(s1, s2)
+                ms = self.merger.score(
+                    s1,
+                    s2,
+                    topic_overlap=topic_overlap,
+                    retrieval_co_use=retrieval_co_use,
+                )
                 if self.merger.should_merge(s1, s2, ms):
                     s1.merge_counter += 1
                     s2.merge_counter += 1
-                    if (s1.merge_counter >= self.cfg.merge_hysteresis
-                            and s2.merge_counter >= self.cfg.merge_hysteresis):
+                    if (
+                        s1.merge_counter >= self.cfg.merge_hysteresis
+                        and s2.merge_counter >= self.cfg.merge_hysteresis
+                    ):
                         s1.state = BranchState.MERGE_CANDIDATE
                         s2.state = BranchState.MERGE_CANDIDATE
-                        self.db.enqueue_job(
-                            "merge",
-                            target_id=s1.branch_id,
-                            payload={"merge_with": s2.branch_id, "score": ms},
-                        )
-                        actions["merge_candidates"] += 1
+                        if not self.db.has_pending_job("merge", s1.branch_id):
+                            self.db.enqueue_job(
+                                "merge",
+                                target_id=s1.branch_id,
+                                payload={
+                                    "merge_with": s2.branch_id,
+                                    "score": float(ms),
+                                    "topic_overlap": float(topic_overlap),
+                                    "retrieval_co_use": float(retrieval_co_use),
+                                },
+                            )
+                            actions["merge_candidates"] += 1
                     self.db.upsert_branch(s1)
                     self.db.upsert_branch(s2)
 
-        # --- Reactivation scan ---
-        dormant = [s for s in all_stats if s and s.state == BranchState.DORMANT]
+        dormant = [s for s in self.db.all_branches() if s and s.state == BranchState.DORMANT]
         for s in dormant:
             if s.reactivation_score > 0.6:
                 s.state = BranchState.REACTIVATING
                 self.db.upsert_branch(s)
                 actions["reactivated"] += 1
 
+        actions["split_executed"] = self.execute_pending_splits(max_jobs=10)
         return actions
 
     # ------------------------------------------------------------------
@@ -1339,17 +1568,7 @@ class GeometryController:
         return bid
 
     def _next_conv_branch_id(self) -> str:
-        max_conv = 0
-        for stats in self.db.all_branches():
-            if not stats:
-                continue
-            bid = stats.branch_id or ""
-            if not bid.startswith("conv_"):
-                continue
-            suffix = bid[5:]
-            if suffix.isdigit():
-                max_conv = max(max_conv, int(suffix))
-        return f"conv_{max_conv + 1}"
+        return self.db.next_conv_branch_id()
 
     def _infer_branch_type(self, node_type: NodeType) -> str:
         if node_type in (NodeType.MESSAGE,):
@@ -1430,6 +1649,315 @@ class GeometryController:
                 s.state = BranchState.ACTIVE
             elif s.state == BranchState.ACTIVE and s.coherence > 0.70:
                 s.state = BranchState.STABLE
+
+    def add_temporal_edge(self, src_node_id: str, dst_node_id: str, weight: float = 1.0) -> None:
+        if not src_node_id or not dst_node_id or src_node_id == dst_node_id:
+            return
+        self.db.add_edge(src_node_id, dst_node_id, EdgeType.TEMPORAL_NEXT, weight=float(weight))
+
+    def _branch_aliases(self, branch_id: str) -> set[str]:
+        aliases: set[str] = {branch_id}
+        rows = self.db.list_branch_nodes(branch_id, include_embeddings=False)
+        for row in rows:
+            nid = str(row.get("id") or "").strip()
+            lcm_id = str(row.get("lcm_id") or "").strip()
+            if nid:
+                aliases.add(nid)
+            if lcm_id:
+                aliases.add(lcm_id)
+                if not lcm_id.startswith("msg_"):
+                    aliases.add(f"msg_{lcm_id}")
+                if not lcm_id.startswith("sn_"):
+                    aliases.add(f"sn_{lcm_id}")
+        return aliases
+
+    def _compute_merge_signals(self, s1: BranchStats, s2: BranchStats) -> tuple[float, float]:
+        aliases_a = self._branch_aliases(s1.branch_id)
+        aliases_b = self._branch_aliases(s2.branch_id)
+        edge_counts = self.db.edge_counts_between_sets(aliases_a, aliases_b)
+
+        topic_types = {
+            EdgeType.SAME_TOPIC.value,
+            EdgeType.SAME_TASK.value,
+            EdgeType.SAME_USER_FACT.value,
+            EdgeType.DERIVED_FROM.value,
+            EdgeType.SUMMARIZES.value,
+            EdgeType.REFINES.value,
+            EdgeType.SEMANTIC_NEIGHBOR.value,
+        }
+        topic_raw = float(sum(edge_counts.get(et, 0) for et in topic_types))
+        temporal_raw = float(edge_counts.get(EdgeType.TEMPORAL_NEXT.value, 0))
+        norm = max(1.0, float(min(len(aliases_a), len(aliases_b))))
+        topic_overlap = min(1.0, (topic_raw + 0.25 * temporal_raw) / norm)
+
+        retrieval_co_use = self.db.retrieval_co_use_score(
+            s1.branch_id,
+            s2.branch_id,
+            lookback=self.cfg.merge_signal_lookback,
+        )
+        return float(topic_overlap), float(retrieval_co_use)
+
+    def _compute_contradiction_signals(self, branch_id: str) -> float:
+        rows = self.db.list_branch_nodes(branch_id, include_embeddings=True)
+        node_ids: list[str] = []
+        vecs: list[np.ndarray] = []
+        for row in rows:
+            emb = row.get("embedding") or []
+            if not emb:
+                continue
+            try:
+                v = np.array(emb, dtype=np.float32)
+            except Exception:
+                continue
+            if v.size <= 0:
+                continue
+            node_ids.append(str(row.get("id")))
+            vecs.append(v)
+
+        if len(vecs) < 2:
+            if node_ids:
+                self.db.remove_edges_for_nodes(node_ids, EdgeType.CONTRADICTS)
+            return 0.0
+
+        embs = np.stack(vecs, axis=0)
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        norms = np.maximum(norms, GeometryMath.EPS)
+        normed = embs / norms
+        sim = np.matmul(normed, normed.T)
+
+        triu_i, triu_j = np.triu_indices(sim.shape[0], k=1)
+        pair_total = len(triu_i)
+        if pair_total <= 0:
+            return 0.0
+
+        th = float(self.cfg.contradiction_sim_threshold)
+        sims = sim[triu_i, triu_j]
+        contrad_mask = sims < th
+        contrad_count = int(np.count_nonzero(contrad_mask))
+        density = float(contrad_count / max(1, pair_total))
+
+        self.db.remove_edges_for_nodes(node_ids, EdgeType.CONTRADICTS)
+        if contrad_count > 0:
+            idx = np.where(contrad_mask)[0]
+            if idx.size > 0:
+                order = idx[np.argsort(sims[idx])]
+                max_pairs = max(0, int(self.cfg.contradiction_edge_max_pairs))
+                if max_pairs > 0:
+                    order = order[:max_pairs]
+                edges: list[tuple[str, str, EdgeType, float]] = []
+                for pos in order:
+                    a = node_ids[int(triu_i[pos])]
+                    b = node_ids[int(triu_j[pos])]
+                    w = float(abs(float(sims[pos])))
+                    edges.append((a, b, EdgeType.CONTRADICTS, w))
+                    edges.append((b, a, EdgeType.CONTRADICTS, w))
+                self.db.add_edges_bulk(edges)
+
+        return density
+
+    def _refresh_branch_geometry_from_db(self, branch_id: str) -> Optional[BranchStats]:
+        s = self.db.load_branch(branch_id)
+        if s is None:
+            return None
+
+        embs, weights = self.db.get_branch_embeddings(branch_id)
+        if embs.shape[0] <= 0:
+            s.node_count = 0
+            s.mean_vec = []
+            s.anchor = []
+            s.cov_diagonal = []
+            s.eff_rank = 0.0
+            s.trace = 0.0
+            s.anisotropy = 0.0
+            s.coherence = 0.0
+            s.contradiction_density = 0.0
+            s.state = BranchState.FORMING
+            s.regime = GeometricRegime.PRODUCTIVE
+            s.last_update_ts = time.time()
+            self.db.upsert_branch(s)
+            return s
+
+        mu = GeometryMath.weighted_mean(embs, weights)
+        stats_dict = GeometryMath.compute_full_stats(embs, weights, mu)
+        var = GeometryMath.covariance_diagonal(embs, weights)
+
+        s.mean_vec = mu.tolist()
+        s.anchor = mu.tolist()
+        s.anchor_drift = 0.0
+        s.cov_diagonal = var.tolist()
+        s.node_count = int(embs.shape[0])
+        s.eff_rank = float(stats_dict["eff_rank"])
+        s.trace = float(stats_dict["trace"])
+        s.anisotropy = float(stats_dict["anisotropy"])
+        s.coherence = float(stats_dict["coherence"])
+        s.contradiction_density = self._compute_contradiction_signals(branch_id)
+        s.regime = self.regime.classify(s)
+        self._update_state_from_regime(s)
+        s.last_update_ts = time.time()
+        self.db.upsert_branch(s)
+        return s
+
+    def _kmeans2_labels(self, embs: np.ndarray) -> np.ndarray:
+        n = int(embs.shape[0])
+        if n <= 1:
+            return np.zeros(n, dtype=np.int32)
+
+        i0 = 0
+        d0 = np.sum((embs - embs[i0]) ** 2, axis=1)
+        i1 = int(np.argmax(d0)) if n > 1 else 0
+        if i1 == i0:
+            i1 = 1 if n > 1 else 0
+        centers = np.stack([embs[i0], embs[i1]], axis=0).astype(np.float32)
+        labels = np.zeros(n, dtype=np.int32)
+
+        max_iter = max(4, int(self.cfg.split_kmeans_max_iter))
+        for _ in range(max_iter):
+            dist = np.sum((embs[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+            new_labels = np.argmin(dist, axis=1).astype(np.int32)
+            if np.array_equal(new_labels, labels):
+                break
+            labels = new_labels
+            for k in (0, 1):
+                idx = np.where(labels == k)[0]
+                if idx.size <= 0:
+                    idx = np.array([int(np.argmax(np.min(dist, axis=1)))])
+                    labels[idx[0]] = k
+                centers[k] = np.mean(embs[idx], axis=0)
+        return labels
+
+    def execute_pending_splits(self, max_jobs: int = 10) -> int:
+        pending = [j for j in self.db.pending_jobs() if str(j.get("job_type")) == "split"]
+        if not pending:
+            return 0
+
+        done = 0
+        for job in pending[:max(1, int(max_jobs))]:
+            jid = str(job.get("id"))
+            branch_id = str(job.get("target_id") or "")
+            if not branch_id:
+                self.db.complete_job(jid)
+                continue
+
+            source = self.db.load_branch(branch_id)
+            if source is None:
+                self.db.complete_job(jid)
+                continue
+
+            rows = self.db.list_branch_nodes(branch_id, include_embeddings=True)
+            node_ids: list[str] = []
+            vecs: list[np.ndarray] = []
+            for row in rows:
+                emb = row.get("embedding") or []
+                if not emb:
+                    continue
+                node_ids.append(str(row.get("id")))
+                vecs.append(np.array(emb, dtype=np.float32))
+
+            if len(node_ids) < max(4, int(self.cfg.split_min_nodes)):
+                source.state = BranchState.ACTIVE if source.state == BranchState.SPLIT_PENDING else source.state
+                source.split_counter = max(0, int(source.split_counter) - 1)
+                source.last_update_ts = time.time()
+                self.db.upsert_branch(source)
+                self.db.complete_job(jid)
+                continue
+
+            embs = np.stack(vecs, axis=0)
+            labels = self._kmeans2_labels(embs)
+            idx_a = np.where(labels == 0)[0].tolist()
+            idx_b = np.where(labels == 1)[0].tolist()
+            if len(idx_a) < 2 or len(idx_b) < 2:
+                source.state = BranchState.TENSIONED
+                source.last_update_ts = time.time()
+                self.db.upsert_branch(source)
+                self.db.complete_job(jid)
+                continue
+
+            child_a = self._create_branch(NodeType.MESSAGE, near=branch_id)
+            child_b = self._create_branch(NodeType.MESSAGE, near=branch_id)
+
+            moved_a = [node_ids[i] for i in idx_a]
+            moved_b = [node_ids[i] for i in idx_b]
+            self.db.reassign_nodes_to_branch(moved_a, child_a)
+            self.db.reassign_nodes_to_branch(moved_b, child_b)
+
+            self.db.add_edge(branch_id, child_a, EdgeType.REFINES, weight=1.0)
+            self.db.add_edge(branch_id, child_b, EdgeType.REFINES, weight=1.0)
+
+            self._refresh_branch_geometry_from_db(child_a)
+            self._refresh_branch_geometry_from_db(child_b)
+
+            source.state = BranchState.COLLAPSING
+            source.node_count = 0
+            source.mean_vec = []
+            source.anchor = []
+            source.cov_diagonal = []
+            source.eff_rank = 0.0
+            source.trace = 0.0
+            source.anisotropy = 0.0
+            source.coherence = 0.0
+            source.contradiction_density = 0.0
+            source.last_update_ts = time.time()
+            self.db.upsert_branch(source)
+
+            self.db.complete_job(jid)
+            done += 1
+
+        return done
+
+    def mark_branch_agent_interest(self, agent_id: str, branch_id: str, weight: float = 1.0) -> None:
+        src = f"agent:{agent_id}"
+        self.db.add_edge(src, branch_id, EdgeType.CROSS_AGENT, weight=float(weight))
+
+    def add_cross_agent_shared_edge(self, source_branch_id: str, target_branch_id: str, weight: float = 1.0) -> None:
+        self.db.add_edge(source_branch_id, target_branch_id, EdgeType.CROSS_AGENT, weight=float(weight))
+
+    def list_cross_agent_links(self, branch_id: Optional[str] = None, limit: int = 200) -> list[dict[str, Any]]:
+        return self.db.list_cross_agent_edges(branch_id=branch_id, limit=limit)
+
+    def health_report(self) -> dict[str, Any]:
+        all_stats = [s for s in self.db.all_branches() if s is not None]
+        state_counts: dict[str, int] = {}
+        regime_counts: dict[str, int] = {}
+        pending_split = 0
+        pending_merge = 0
+        mean_coh = 0.0
+        mean_comp = 0.0
+        total_nodes = 0
+
+        for s in all_stats:
+            state = s.state.value
+            regime = s.regime.value
+            state_counts[state] = state_counts.get(state, 0) + 1
+            regime_counts[regime] = regime_counts.get(regime, 0) + 1
+            if s.state == BranchState.SPLIT_PENDING:
+                pending_split += 1
+            if s.state == BranchState.MERGE_CANDIDATE:
+                pending_merge += 1
+            mean_coh += float(s.coherence)
+            mean_comp += float(s.compression_loss)
+            total_nodes += int(s.node_count)
+
+        n = len(all_stats)
+        jobs = self.db.pending_jobs()
+        pending_jobs = len(jobs)
+        pending_job_types: dict[str, int] = {}
+        for j in jobs:
+            jt = str(j.get("job_type") or "unknown")
+            pending_job_types[jt] = pending_job_types.get(jt, 0) + 1
+
+        return {
+            "branches": n,
+            "states": state_counts,
+            "regimes": regime_counts,
+            "pending_split_branches": pending_split,
+            "pending_merge_branches": pending_merge,
+            "pending_jobs": pending_jobs,
+            "pending_job_types": pending_job_types,
+            "mean_coherence": (mean_coh / n) if n > 0 else 0.0,
+            "mean_compression_loss": (mean_comp / n) if n > 0 else 0.0,
+            "total_node_count": total_nodes,
+            "cross_agent_edges": len(self.list_cross_agent_links(limit=10000)),
+        }
 
     # ------------------------------------------------------------------
     # Public utility: mark reactivation interest
@@ -1560,9 +2088,93 @@ class GeometryController:
 
         lcm.close()
         return stats
+    # ------------------------------------------------------------------
+    # Incremental polling API (real-time LCM ingest)
+    # ------------------------------------------------------------------
+
+    def poll_lcm_for_new_items(
+        self,
+        lcm_db_path: str,
+        since_rowid: int = 0,
+        limit: int = 200,
+        conversation_id: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """
+        Incrementally ingest new LCM messages since a rowid cursor.
+        """
+        if self.embedding_provider is None:
+            raise ValueError(
+                "poll_lcm_for_new_items requires self.embedding_provider. "
+                "Pass embedding_provider=EmbeddingProvider() to GeometryController."
+            )
+
+        safe_limit = max(1, int(limit))
+        safe_since = max(0, int(since_rowid))
+        lcm = sqlite3.connect(lcm_db_path)
+        lcm.row_factory = sqlite3.Row
+
+        try:
+            if conversation_id is None:
+                rows = lcm.execute(
+                    "SELECT rowid AS _rid, message_id, conversation_id, seq, role, content, token_count, created_at "
+                    "FROM messages WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
+                    (safe_since, safe_limit),
+                ).fetchall()
+            else:
+                rows = lcm.execute(
+                    "SELECT rowid AS _rid, message_id, conversation_id, seq, role, content, token_count, created_at "
+                    "FROM messages WHERE rowid > ? AND conversation_id = ? ORDER BY rowid ASC LIMIT ?",
+                    (safe_since, int(conversation_id), safe_limit),
+                ).fetchall()
+
+            if not rows:
+                return {
+                    "polled": 0,
+                    "processed": 0,
+                    "failed": 0,
+                    "since_rowid": safe_since,
+                    "next_rowid": safe_since,
+                    "has_more": False,
+                }
+
+            texts = [(r["content"] or "")[:1000] for r in rows]
+            embeddings = self.embedding_provider.embed_batch(texts)
+
+            processed = 0
+            failed = 0
+            next_rowid = safe_since
+
+            for row, emb in zip(rows, embeddings):
+                rid = int(row["_rid"])
+                next_rowid = max(next_rowid, rid)
+                try:
+                    cid = row["conversation_id"]
+                    active = f"conv_{int(cid)}" if cid is not None else None
+                    self.on_new_item(
+                        lcm_id=str(row["message_id"]),
+                        node_type=NodeType.MESSAGE,
+                        embedding=emb,
+                        role=row["role"] or "user",
+                        token_count=int(row["token_count"] or 0),
+                        active_branch_id=active,
+                    )
+                    processed += 1
+                except Exception:
+                    failed += 1
+
+            return {
+                "polled": len(rows),
+                "processed": processed,
+                "failed": failed,
+                "since_rowid": safe_since,
+                "next_rowid": next_rowid,
+                "has_more": len(rows) >= safe_limit,
+            }
+        finally:
+            lcm.close()
 
     # ------------------------------------------------------------------
-    # Fix 4 — Import DAG edges from LCM
+    # Fix 4 - Import DAG edges from LCM
     # ------------------------------------------------------------------
 
     def import_dag_edges_from_lcm(self, lcm_db_path: str) -> dict[str, int]:

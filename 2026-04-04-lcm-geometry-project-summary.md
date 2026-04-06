@@ -1,7 +1,7 @@
-# LCM Geometry Module - Project Summary
+﻿# LCM Geometry Module - Project Summary
 
-**Status:** Active (OpenClaw + MCP runtime)  
-**Last Updated:** 2026-04-05
+**Status:** Active (OpenClaw + MCP runtime)
+**Last Updated:** 2026-04-06
 
 ## Purpose
 
@@ -19,6 +19,24 @@ This project adds a semantic geometry layer on top of OpenClaw LCM memory.
 - OpenClaw runtime data:
   - `<openclaw_home>/lcm.db`
   - `<openclaw_home>/lcm_geometry.db`
+
+## Current capabilities (v1.2 line)
+
+- Real-time compatible ingest API via `poll_lcm_for_new_items(...)`
+- Parent-aware node insertion (`parent_lcm_id`) + `TEMPORAL_NEXT` link creation
+- Contradiction refresh pipeline:
+  - contradiction density recomputation per branch
+  - bounded `CONTRADICTS` edge regeneration
+- Merge scoring with runtime evidence:
+  - graph overlap (memory edges)
+  - retrieval co-use signal
+- Split execution pipeline:
+  - pending split jobs executed automatically
+  - internal k-means(2) branch partitioning
+  - `REFINES` edges from source to child branches
+- Operational observability APIs:
+  - `health_report()`
+  - cross-agent links (`mark_branch_agent_interest`, `add_cross_agent_shared_edge`, `list_cross_agent_links`)
 
 ## What is required for a working setup
 
@@ -68,6 +86,7 @@ openclaw mcp list
 ## Operational notes
 
 - Backfill is the key synchronization step between LCM and geometry.
+- For incremental ingest, use `poll_lcm_for_new_items(...)` with a persisted rowid cursor.
 - If retrieval quality drops or results look stale, run backfill again.
 - `GEOMETRY_CONTROLLER_MANUAL.md` is the full reference.
 - `GEOMETRY_MODULE_TUTORIAL.md` is the practical user/agent guide.
