@@ -30,7 +30,7 @@
 
 ## 1. What Is the Geometry Controller?
 
-The geometry controller is a semantic memory layer that sits alongside OpenClaw's LCM (Long-Term Context Memory). It annotates each conversation branch with **geometric state** — embedding centroids, anisotropy, coherence, effective rank — and uses these signals to:
+The geometry controller is a semantic memory layer that sits alongside OpenClaw's LCM (Lossless Context Management). It annotates each conversation branch with **geometric state** — embedding centroids, anisotropy, coherence, effective rank — and uses these signals to:
 
 - **Score** where a new message best belongs (which branch it fits)
 - **Classify** branch health: PRODUCTIVE, RIGID, or UNSTABLE
