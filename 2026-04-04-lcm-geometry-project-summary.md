@@ -1,7 +1,7 @@
 ﻿# LCM Geometry Module - Project Summary
 
 **Status:** Active (OpenClaw + MCP runtime)
-**Last Updated:** 2026-04-06
+**Last Updated:** 2026-04-08
 
 ## Purpose
 
@@ -48,6 +48,15 @@ This project adds a semantic geometry layer on top of OpenClaw LCM memory.
 - Operational observability APIs:
   - `health_report()`
   - cross-agent links (`mark_branch_agent_interest`, `add_cross_agent_shared_edge`, `list_cross_agent_links`)
+- Performance/runtime hardening:
+  - scalar/lazy branch loading for retrieval and allocation prefilter
+  - bounded contradiction compute for large branches (temporal stratified sampling)
+  - merge execution pipeline (`soft` mode) with queue drain
+  - dormancy policy based on inactivity + usefulness
+  - split child prior propagation (usefulness/retrieval_error + centroid anchor seed)
+- Runtime config support in MCP server:
+  - optional `extensions/geometry-mcp/runtime_config.json`
+  - env override `GEOMETRY_RUNTIME_CONFIG_JSON`
 
 ## What is required for a working setup
 
@@ -75,6 +84,7 @@ mkdir -p "$OPENCLAW_HOME/extensions/geometry-mcp"
 cp lcm_geometry_controller.py "$OPENCLAW_HOME/workspace/module/"
 cp lcm_geometry_backfill.py "$OPENCLAW_HOME/workspace/module/"
 cp extensions/geometry-mcp/server.py "$OPENCLAW_HOME/extensions/geometry-mcp/"
+cp extensions/geometry-mcp/runtime_config.example.json "$OPENCLAW_HOME/extensions/geometry-mcp/"
 
 # 3) build geometry db
 OPENCLAW_HOME="$OPENCLAW_HOME" \

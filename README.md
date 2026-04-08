@@ -2,35 +2,29 @@
 
 Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geometry-aware tools.
 
-## Latest Update (2026-04-06)
+## Latest Update (2026-04-08)
 
-- Added incremental ingest API: `poll_lcm_for_new_items(...)` for rowid-cursor polling from `lcm.db`.
-- `on_new_item(...)` now supports `parent_lcm_id`, resolves parent linkage, and writes `TEMPORAL_NEXT` edges.
-- Added contradiction refresh in maintenance:
-  - branch contradiction density recomputed from embeddings
-  - `CONTRADICTS` edges refreshed (bounded by config)
-- Merge scoring now uses real runtime signals:
-  - graph overlap via memory edges
-  - retrieval co-use from feedback history
-- Added split execution path:
-  - pending split jobs are executed with internal k-means(2)
-  - child branches are created and linked with `REFINES` edges
-- Hardened split gating and queue behavior:
-  - split scoring threshold is config-driven (`split_score_threshold`)
-  - split readiness requires both state/node rows and real embedded rows
-  - readiness uses `max(split_min_nodes, min_branch_size)` to avoid small-branch over-triggering
-  - per-cycle split enqueue cap (`max_split_enqueues_per_cycle`) with score-priority selection
-- Added split decision observability:
-  - persisted per-branch maintenance trace rows in `maintenance_split_observations`
-  - reasons include candidate, throttled, enqueued rank, and gate/hysteresis outcomes
-- Improved backfill operational reliability:
-  - branch-locked insertion via `force_branch_id` to preserve conversation-to-branch topology
-  - structured backfill error logging with `errors_logged` count in returned stats
-- Added operations APIs:
-  - `health_report()`
-  - `mark_branch_agent_interest(...)`
-  - `add_cross_agent_shared_edge(...)`
-  - `list_cross_agent_links(...)`
+- Added scalar/lazy branch loading paths:
+  - retrieval prefilter by branch scalars (`retrieval_prefilter_limit`)
+  - candidate prefilter for `on_new_item(...)` (`candidate_prefilter_limit`, `candidate_branch_cap`)
+  - `health_report()` now uses scalar scan instead of full geometry blob load
+- Added merge execution pipeline (safe mode):
+  - `execute_pending_merges(...)` wired into maintenance
+  - `merge_execution_mode="soft"` creates `SAME_TOPIC` affinity edges and drains merge queue
+- Added bounded contradiction compute for large branches:
+  - deterministic temporal stratified sampling before cosine matrix
+  - controlled by `contradiction_sample_min_nodes` / `contradiction_sample_max_nodes`
+- Added real dormancy policy:
+  - inactivity + low-usefulness -> `DORMANT`
+  - activity-based wake path `DORMANT -> REACTIVATING -> ACTIVE`
+  - controlled by `dormant_after_days`, `dormant_usefulness_max`, `dormant_min_nodes`
+- Added split child prior propagation:
+  - child branches inherit parent `usefulness` and `retrieval_error`
+  - child anchor can be seeded from split cluster centroid
+  - controlled by `split_child_copy_*` options
+- MCP server now supports runtime config file/env overrides:
+  - `extensions/geometry-mcp/runtime_config.json`
+  - `GEOMETRY_RUNTIME_CONFIG_JSON`
 
 ## What is included
 
@@ -80,7 +74,17 @@ mkdir -p "$OPENCLAW_HOME/extensions/geometry-mcp"
 cp lcm_geometry_controller.py "$OPENCLAW_HOME/workspace/module/"
 cp lcm_geometry_backfill.py "$OPENCLAW_HOME/workspace/module/"
 cp extensions/geometry-mcp/server.py "$OPENCLAW_HOME/extensions/geometry-mcp/"
+cp extensions/geometry-mcp/runtime_config.example.json "$OPENCLAW_HOME/extensions/geometry-mcp/"
 ```
+
+Optional: create runtime config for MCP server:
+
+```bash
+cp "$OPENCLAW_HOME/extensions/geometry-mcp/runtime_config.example.json" \
+   "$OPENCLAW_HOME/extensions/geometry-mcp/runtime_config.json"
+```
+
+Then edit `runtime_config.json` to tune `geometry_config` fields.
 
 ## Build/refresh geometry database
 
@@ -107,6 +111,36 @@ openclaw mcp list
 ```
 
 Expected server name: `geometry-hybrid`.
+
+## Runtime tuning (new)
+
+The MCP server automatically loads runtime overrides from:
+
+- `<openclaw_home>/extensions/geometry-mcp/runtime_config.json` (if present)
+- env var `GEOMETRY_RUNTIME_CONFIG_JSON` (JSON object; merged on top)
+
+Useful keys in `geometry_config`:
+
+- Retrieval/lazy loading:
+  - `retrieval_prefilter_limit`
+  - `retrieval_result_limit`
+  - `candidate_prefilter_limit`
+  - `candidate_branch_cap`
+- Merge execution:
+  - `merge_execution_mode` (`soft` or `off`)
+  - `merge_max_jobs_per_cycle`
+  - `merge_soft_edge_weight`
+- Contradiction bounded compute:
+  - `contradiction_sample_min_nodes`
+  - `contradiction_sample_max_nodes`
+- Dormancy policy:
+  - `dormant_after_days`
+  - `dormant_usefulness_max`
+  - `dormant_min_nodes`
+- Split child priors:
+  - `split_child_copy_usefulness`
+  - `split_child_copy_retrieval_error`
+  - `split_child_anchor_from_centroid`
 
 ## MCP tools provided
 

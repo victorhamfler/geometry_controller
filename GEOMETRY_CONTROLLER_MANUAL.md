@@ -1,10 +1,10 @@
 # LCM Geometry Controller — Manual
 
-**Version:** 1.3
+**Version:** 1.4
 **Module:** `lcm_geometry_controller.py`
 **Geometry DB:** `<openclaw_home>/lcm_geometry.db`
 **LCM DB:** `<openclaw_home>/lcm.db`
-**Last Updated:** 2026-04-06
+**Last Updated:** 2026-04-08
 
 ---
 
@@ -74,8 +74,8 @@ Each conversation branch gets:
 
 ```
 FORMING → ACTIVE → STABLE
-ACTIVE/STABLE → DORMANT → REACTIVATING → ACTIVE
-STABLE → MERGE_CANDIDATE → (merged)
+ACTIVE/STABLE/TENSIONED → DORMANT → REACTIVATING → ACTIVE
+STABLE → MERGE_CANDIDATE → (soft-merged affinity in current mode)
 ACTIVE → SPLIT_PENDING → (forked)
 ```
 
@@ -156,8 +156,8 @@ print(r['state'], r['regime'], r['eff_rank'], r['coherence'])
 | `branch_id` | TEXT PK | Primary key (e.g. `conv_1`) |
 | `state` | TEXT | BranchState enum: FORMING, ACTIVE, STABLE, TENSIONED, DORMANT, etc. |
 | `regime` | TEXT | GeometricRegime: PRODUCTIVE, RIGID, UNSTABLE |
-| `mean_vec` | TEXT (JSON) | 384-dim centroid as JSON list |
-| `cov_diagonal` | TEXT (JSON) | Variance per dimension |
+| `mean_vec` | BLOB (JSON bytes) | 384-dim centroid as JSON list |
+| `cov_diagonal` | BLOB (JSON bytes) | Variance per dimension |
 | `eff_rank` | REAL | Effective rank (1–384) |
 | `anisotropy` | REAL | Variance concentration proxy (`max_eigenvalue / sum_eigenvalues`) |
 | `coherence` | REAL | Mean pairwise cosine similarity |
@@ -165,13 +165,12 @@ print(r['state'], r['regime'], r['eff_rank'], r['coherence'])
 | `compression_loss` | REAL | Compression error (reconstruction from low-rank) |
 | `contradiction_density` | REAL | Density of contradictory message pairs |
 | `retrieval_error` | REAL | EMA of retrieval mis-match scores |
-| `anchor` | TEXT (JSON) | Stable reference centroid |
+| `anchor` | BLOB (JSON bytes) | Stable reference centroid |
 | `anchor_drift` | REAL | Distance current mean_vec has drifted from anchor |
 | `node_count` | INT | Number of memory_nodes in this branch |
 | `split_counter` | INT | Consecutive high split scores |
 | `merge_counter` | INT | Consecutive merge candidates |
 | `last_update_ts` | REAL | Unix timestamp of last update |
-| `created_ts` | REAL | Unix timestamp of creation |
 
 ### `memory_nodes` — Per-Message/Per-Summary Embeddings
 
@@ -184,26 +183,29 @@ print(r['state'], r['regime'], r['eff_rank'], r['coherence'])
 | `branch_id` | TEXT FK | Owning branch |
 | `timestamp` | REAL | When added |
 | `role` | TEXT | Message role: user, assistant, system |
-| `embedding` | TEXT (JSON) | 384-dim vector as JSON list |
+| `embedding` | BLOB (JSON bytes) | 384-dim vector as JSON list |
 
 ### `memory_edges` — DAG Edges
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `id` | TEXT PK | Edge ID |
-| `source_id` | TEXT FK | Source node |
-| `target_id` | TEXT FK | Target node |
+| `src_id` | TEXT | Source node |
+| `dst_id` | TEXT | Target node |
 | `edge_type` | TEXT | EdgeType: DERIVED_FROM, SUMMARIZES, REFINES, CONTRADICTS |
 | `weight` | REAL | Edge weight (default 1.0) |
 
-### `retrieval_feedback` — Feedback Signals (Future)
+### `retrieval_feedback` — Retrieval Feedback Signals
 
 | Column | Type | Description |
 |--------|------|-------------|
+| `id` | TEXT PK | Feedback row ID |
 | `branch_id` | TEXT | Retrieved branch |
-| `query_hash` | TEXT | Hashed query text |
-| `usefulness` | REAL | User/agent signal: was this retrieval useful? |
-| `ts` | REAL | Timestamp |
+| `query_id` | TEXT | Query correlation ID |
+| `score` | REAL | Retrieval score at selection time |
+| `used` | INTEGER | Whether result was used |
+| `corrected` | INTEGER | Whether retrieval was corrected |
+| `expanded` | INTEGER | Whether branch expansion was requested |
+| `timestamp` | REAL | Timestamp |
 
 ### `maintenance_split_observations` — Split Decision Trace
 
@@ -303,18 +305,22 @@ Full maintenance sweep over all branches. Should be run periodically (every 20�
 1. **Recomputes geometry** for each branch from its `memory_nodes` rows
 2. **Refreshes contradiction signals** (density + bounded `CONTRADICTS` edges)
 3. **Reclassifies regime** - PRODUCTIVE / RIGID / UNSTABLE
-4. **Scans for splits and prepares ranked candidates** when gate + hysteresis conditions are met
-5. **Scores merges with runtime signals** (graph overlap + retrieval co-use)
-6. **Executes pending split jobs** (k-means(2), child branches, `REFINES` edges)
-7. **Runs reactivation scan**
+4. **Applies dormancy policy** based on real branch activity age + usefulness thresholds
+5. **Scans for splits and prepares ranked candidates** when gate + hysteresis conditions are met
+6. **Scores merges with runtime signals** (graph overlap + retrieval co-use)
+7. **Executes pending split jobs** (k-means(2), child branches, `REFINES` edges + child priors)
+8. **Executes pending merge jobs** (soft merge mode: affinity edges + queue drain)
+9. **Runs reactivation scan**
 
 **Returns:** `dict` with counts:
 ```python
 {
     'recomputed': 437,
+    'dormant_marked': 2,
     'split_pending': 0,
     'split_executed': 0,
     'merge_candidates': 0,
+    'merge_executed': 1,
     'reactivated': 0,
     'split_observations': 437,
     'split_trace_run_id': '...'
@@ -382,8 +388,23 @@ gc = GeometryController('/path/to/lcm_geometry.db', cfg=cfg)
 | `split_min_nodes` | 6 | Baseline split gate; effective gate uses `max(split_min_nodes, min_branch_size)` |
 | `split_hysteresis` | 3 | Consecutive high scores → SPLIT_PENDING |
 | `max_split_enqueues_per_cycle` | 5 | Maximum split jobs enqueued per maintenance cycle (score-ranked) |
+| `split_child_copy_usefulness` | True | Copy parent usefulness to split children |
+| `split_child_copy_retrieval_error` | True | Copy parent retrieval error to split children |
+| `split_child_anchor_from_centroid` | True | Seed split child anchor from cluster centroid |
 | `merge_hysteresis` | 3 | Consecutive merge candidates → MERGE_CANDIDATE |
+| `merge_execution_mode` | `soft` | Merge execution mode (`soft`/`off`) |
+| `merge_max_jobs_per_cycle` | 5 | Max merge jobs executed per maintenance cycle |
+| `merge_soft_edge_weight` | 1.0 | Fallback SAME_TOPIC edge weight in soft merges |
 | `usefulness_lambda` | 0.10 | EMA decay for usefulness signals |
+| `retrieval_prefilter_limit` | 256 | Max branches in scalar retrieval prefilter shortlist |
+| `retrieval_result_limit` | 128 | Max retrieval candidates returned |
+| `candidate_prefilter_limit` | 128 | Max branches inspected by scalar prefilter for `on_new_item` |
+| `candidate_branch_cap` | 10 | Max full branches loaded for final allocation scoring |
+| `contradiction_sample_min_nodes` | 64 | Minimum sample target for contradiction compute on large branches |
+| `contradiction_sample_max_nodes` | 192 | Sampling cap for contradiction compute (`0` disables cap) |
+| `dormant_after_days` | 14.0 | Activity age threshold to mark dormant |
+| `dormant_usefulness_max` | 0.20 | Dormancy requires usefulness at/below this value |
+| `dormant_min_nodes` | 8 | Minimum branch size before dormancy policy applies |
 | `rank_target` | dict | eff_rank target bands per branch type |
 | `rigid_rank_ratio` | 0.15 | eff_rank below this → RIGID regime |
 | `unstable_coh_floor` | 0.45 | Coherence below this → UNSTABLE |
@@ -470,13 +491,16 @@ Run `gc.run_maintenance_cycle()` every 20–30 minutes. It:
 1. **Recomputes geometry** for each branch from its `memory_nodes` rows
 2. **Updates scalars** (eff_rank, anisotropy, coherence, trace) via adiabatic EMA
 3. **Reclassifies regime** — PRODUCTIVE / RIGID / UNSTABLE
-4. **Scans for splits** — branch must pass:
+4. **Applies dormancy policy** — inactive + low-usefulness branches move to `DORMANT`
+5. **Scans for splits** — branch must pass:
    - score gate: `split_score > split_score_threshold`
    - node readiness gate: `node_count >= max(split_min_nodes, min_branch_size)`
    - real-node readiness gate: embedded rows also meet the same threshold
    - hysteresis gate: `split_counter >= split_hysteresis`
    Eligible branches are score-ranked and throttled by `max_split_enqueues_per_cycle`.
-5. **Scans for merges** — stable branches with high topic overlap → `MERGE_CANDIDATE`
+6. **Scans for merges** — stable/dormant branches with high topic overlap → `MERGE_CANDIDATE`
+7. **Executes pending split jobs** — children inherit key priors and centroid-seeded anchors
+8. **Executes pending merge jobs** — in `soft` mode, writes SAME_TOPIC affinity edges and drains queue
 
 ### Running as Cron
 
@@ -630,6 +654,17 @@ Registered in `<openclaw_home>/openclaw.json` under `mcp.servers`:
 openclaw gateway restart
 ```
 
+Optional runtime tuning for MCP:
+
+1. Copy:
+```bash
+cp <module_repo_root>/extensions/geometry-mcp/runtime_config.example.json \
+   <openclaw_home>/extensions/geometry-mcp/runtime_config.json
+```
+2. Edit `runtime_config.json` (`geometry_config` section).
+3. Restart gateway.  
+The server also supports env override `GEOMETRY_RUNTIME_CONFIG_JSON` (JSON object).
+
 ---
 
 ## 13. Current Enhancements
@@ -666,6 +701,11 @@ The current controller build includes these production features:
     - deterministic branch-lock insertion via `force_branch_id`
     - structured backfill error log writing + `errors_logged` return metric
 11. **Persisted CSD EMA state** (`csd_ema_state`) and retrieval history consistency updates.
+12. **Scalar/lazy loading paths** for retrieval/candidate selection to avoid full-blob scans.
+13. **Soft merge execution** with pending merge queue draining.
+14. **Bounded contradiction compute** via temporal stratified sampling on large branches.
+15. **Dormancy lifecycle policy** based on real activity age + usefulness.
+16. **Split child priors** (usefulness/retrieval_error inheritance + centroid anchor seeding).
 
 ---
 

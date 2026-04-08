@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-LCM Geometry MCP Server  v1.1
+LCM Geometry MCP Server  v1.2
 Exposes geometry + LCM hybrid search as an MCP tool for OpenClaw.
 
 Changelog:
   v1.0  hybrid_search, branch_report, geometry_stats
   v1.1  added conversation_content (bridges geometry  LCM text)
+  v1.2  added runtime config loading + daily-log support
 
 Usage:
     Test locally: python3 server.py
@@ -15,6 +16,7 @@ Usage:
 """
 import sys
 import os
+import json
 
 # Resolve workspace/module path  going up from extensions/geometry-mcp/  extensions/  ~/.openclaw/
 SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,8 +32,60 @@ import sqlite3
 from collections import defaultdict
 
 # DB paths
-GEO_DB = os.path.join(OPENCLAW_HOME, 'lcm_geometry.db')
-LCM_DB = os.path.join(OPENCLAW_HOME, 'lcm.db')
+DEFAULT_GEO_DB = os.path.join(OPENCLAW_HOME, 'lcm_geometry.db')
+DEFAULT_LCM_DB = os.path.join(OPENCLAW_HOME, 'lcm.db')
+RUNTIME_CONFIG_PATH = os.path.join(SKILL_DIR, "runtime_config.json")
+
+
+def _read_json_file(path):
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        print(f"[geometry-mcp] Failed to read runtime config file {path}: {exc}", file=sys.stderr)
+        return {}
+
+
+def _deep_merge_dict(base, updates):
+    out = dict(base or {})
+    for k, v in (updates or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge_dict(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _load_runtime_config():
+    cfg = _read_json_file(RUNTIME_CONFIG_PATH)
+    raw = os.getenv("GEOMETRY_RUNTIME_CONFIG_JSON", "").strip()
+    if raw:
+        try:
+            env_cfg = json.loads(raw)
+            if isinstance(env_cfg, dict):
+                cfg = _deep_merge_dict(cfg, env_cfg)
+        except Exception as exc:
+            print(f"[geometry-mcp] Invalid GEOMETRY_RUNTIME_CONFIG_JSON: {exc}", file=sys.stderr)
+    return cfg
+
+
+_RUNTIME_CFG = _load_runtime_config()
+_PATHS_CFG = _RUNTIME_CFG.get("paths", {}) if isinstance(_RUNTIME_CFG.get("paths"), dict) else {}
+GEO_DB = str(_PATHS_CFG.get("geo_db") or _RUNTIME_CFG.get("geo_db") or DEFAULT_GEO_DB)
+LCM_DB = str(_PATHS_CFG.get("lcm_db") or _RUNTIME_CFG.get("lcm_db") or DEFAULT_LCM_DB)
+EMBED_MODEL_NAME = str(_RUNTIME_CFG.get("embedding_model") or "all-MiniLM-L6-v2")
+_GEOMETRY_CFG_OVERRIDES = _RUNTIME_CFG.get("geometry_config", {})
+if not isinstance(_GEOMETRY_CFG_OVERRIDES, dict):
+    _GEOMETRY_CFG_OVERRIDES = {}
+
+print(
+    f"[geometry-mcp] runtime cfg loaded: geo_db={GEO_DB} lcm_db={LCM_DB} "
+    f"model={EMBED_MODEL_NAME} geometry_overrides={len(_GEOMETRY_CFG_OVERRIDES)}",
+    file=sys.stderr,
+)
 
 #  Lazy-load heavy libs 
 _model = None
@@ -41,15 +95,52 @@ def get_model():
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer('all-MiniLM-L6-v2')
+        _model = SentenceTransformer(EMBED_MODEL_NAME)
     return _model
 
 def get_gc():
     global _gc
     if _gc is None:
-        from lcm_geometry_controller import GeometryController
-        _gc = GeometryController(GEO_DB)
+        from lcm_geometry_controller import GeometryController, GeometryConfig
+        if _GEOMETRY_CFG_OVERRIDES:
+            valid_keys = set(getattr(GeometryConfig, "__dataclass_fields__", {}).keys())
+            safe_overrides = {}
+            for k, v in _GEOMETRY_CFG_OVERRIDES.items():
+                if k in valid_keys:
+                    safe_overrides[k] = v
+                else:
+                    print(f"[geometry-mcp] Ignoring unknown geometry_config key: {k}", file=sys.stderr)
+            _gc = GeometryController(GEO_DB, cfg=GeometryConfig(**safe_overrides))
+        else:
+            _gc = GeometryController(GEO_DB)
     return _gc
+
+
+def _get_daily_log_content(gdb_conn, branch_id, max_entries, max_chars):
+    rows = gdb_conn.execute(
+        """
+        SELECT mn.id AS node_id,
+               mn.timestamp AS created_at,
+               dl.source AS source,
+               SUBSTR(dl.text, 1, ?) AS text
+        FROM memory_nodes mn
+        JOIN daily_log_content dl ON dl.node_id = mn.id
+        WHERE mn.branch_id = ?
+        ORDER BY mn.timestamp ASC, mn.rowid ASC
+        LIMIT ?
+        """,
+        (max_chars, branch_id, max_entries),
+    ).fetchall()
+    return [
+        {
+            "type": "daily_log",
+            "source": r["source"],
+            "created_at": r["created_at"],
+            "text": r["text"],
+            "node_id": r["node_id"],
+        }
+        for r in rows
+    ]
 
 #  Hybrid search 
 def do_hybrid_search(query, top_n=5):
@@ -80,6 +171,8 @@ def do_hybrid_search(query, top_n=5):
     keywords = [w.strip() for w in query.split() if len(w.strip()) >= 3]
     conn = sqlite3.connect(LCM_DB)
     conn.row_factory = sqlite3.Row
+    gconn = sqlite3.connect(GEO_DB)
+    gconn.row_factory = sqlite3.Row
 
     results_by_conv = defaultdict(list)
     for kw in keywords:
@@ -114,6 +207,82 @@ def do_hybrid_search(query, top_n=5):
     scored.sort(key=lambda x: (x['unique_keywords_matched'], x['total_matches']), reverse=True)
     lcm_results = scored[:top_n]
 
+    # Daily log sidecar search (keyword + semantic)
+    daily_keyword = []
+    for kw in keywords:
+        rows = gconn.execute(
+            """
+            SELECT mn.branch_id, mn.id AS node_id, mn.timestamp AS created_at,
+                   SUBSTR(dl.text, 1, 140) AS snippet
+            FROM daily_log_content dl
+            JOIN memory_nodes mn ON mn.id = dl.node_id
+            WHERE dl.text LIKE ?
+            ORDER BY mn.timestamp DESC, mn.rowid DESC
+            LIMIT ?
+            """,
+            (f"%{kw}%", max(5, int(top_n) * 4)),
+        ).fetchall()
+        for r in rows:
+            daily_keyword.append({
+                "branch_id": r["branch_id"],
+                "node_id": r["node_id"],
+                "created_at": r["created_at"],
+                "keyword_matched": kw,
+                "snippet": r["snippet"],
+            })
+    # De-duplicate by node_id preserving first hit.
+    seen_nodes = set()
+    dedup_keyword = []
+    for row in daily_keyword:
+        nid = row["node_id"]
+        if nid in seen_nodes:
+            continue
+        seen_nodes.add(nid)
+        dedup_keyword.append(row)
+    daily_keyword = dedup_keyword[:top_n]
+
+    daily_semantic = []
+    try:
+        import numpy as np
+        q = np.array(q_emb, dtype=np.float32)
+        rows = gconn.execute(
+            """
+            SELECT mn.branch_id, mn.id AS node_id, mn.timestamp AS created_at,
+                   mn.embedding AS embedding,
+                   SUBSTR(dl.text, 1, 140) AS snippet
+            FROM daily_log_content dl
+            JOIN memory_nodes mn ON mn.id = dl.node_id
+            WHERE mn.embedding IS NOT NULL
+            ORDER BY mn.timestamp DESC, mn.rowid DESC
+            LIMIT 2000
+            """
+        ).fetchall()
+        for r in rows:
+            blob = r["embedding"]
+            if not blob:
+                continue
+            try:
+                v = np.array(json.loads(blob.decode()), dtype=np.float32)
+            except Exception:
+                continue
+            den = (np.linalg.norm(q) * np.linalg.norm(v))
+            if den <= 1e-9:
+                continue
+            sim = float(np.dot(q, v) / den)
+            daily_semantic.append({
+                "branch_id": r["branch_id"],
+                "node_id": r["node_id"],
+                "created_at": r["created_at"],
+                "sem_score": round(sim, 4),
+                "snippet": r["snippet"],
+            })
+        daily_semantic.sort(key=lambda x: x["sem_score"], reverse=True)
+        daily_semantic = daily_semantic[:top_n]
+    except Exception:
+        daily_semantic = []
+    finally:
+        gconn.close()
+
     # Recommendation
     lcm_count = len(lcm_results)
     geo_top = geo_results[0]['sem_score'] if geo_results else 0
@@ -131,7 +300,11 @@ def do_hybrid_search(query, top_n=5):
         'query': query,
         'recommendation': recommendation,
         'geometry': {'results': geo_results},
-        'lcm': {'conversations': lcm_results, 'keywords': keywords}
+        'lcm': {'conversations': lcm_results, 'keywords': keywords},
+        'daily_logs': {
+            'keyword_results': daily_keyword,
+            'semantic_results': daily_semantic,
+        },
     }
 
 #  Branch report 
@@ -145,8 +318,39 @@ def do_branch_report(branch_id):
     conn.row_factory = sqlite3.Row
     cur = conn.execute("SELECT COUNT(*) as n FROM memory_nodes WHERE branch_id = ?", (branch_id,))
     node_count = cur.fetchone()['n']
+    daily_count = 0
+    latest_daily = None
+    if str(branch_id).startswith("day_"):
+        cur = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM daily_log_content dl
+            JOIN memory_nodes mn ON mn.id = dl.node_id
+            WHERE mn.branch_id = ?
+            """,
+            (branch_id,),
+        )
+        daily_count = cur.fetchone()["n"]
+        cur = conn.execute(
+            """
+            SELECT SUBSTR(dl.text, 1, 160) AS text
+            FROM daily_log_content dl
+            JOIN memory_nodes mn ON mn.id = dl.node_id
+            WHERE mn.branch_id = ?
+            ORDER BY mn.timestamp DESC, mn.rowid DESC
+            LIMIT 1
+            """,
+            (branch_id,),
+        )
+        row = cur.fetchone()
+        latest_daily = row["text"] if row else None
     conn.close()
-    return {**rpt, 'db_node_count': node_count}
+    out = {**rpt, 'db_node_count': node_count}
+    if str(branch_id).startswith("day_"):
+        out["daily_log_entries"] = int(daily_count)
+        if latest_daily:
+            out["latest_daily_log"] = latest_daily
+    return out
 
 #  Geometry stats 
 def do_geometry_stats():
@@ -173,7 +377,7 @@ def do_geometry_stats():
         'regimes': regimes,
         'avg_eff_rank': avg_rank,
         'avg_coherence': avg_coh,
-        'embedding_model': 'all-MiniLM-L6-v2',
+        'embedding_model': EMBED_MODEL_NAME,
         'embedding_dim': 384
     }
 
@@ -223,8 +427,11 @@ def do_conversation_content(branch_id=None, state=None, content_type="summaries"
         if not b:
             gdb.close(); lcm.close()
             return {"error": f"Branch {branch_id} not found"}
-        cid = int(branch_id.replace("conv_", ""))
-        entries = _get_lcm_content(lcm, cid, content_type, max_entries, max_chars)
+        if str(branch_id).startswith("day_") or content_type == "logs":
+            entries = _get_daily_log_content(gdb, branch_id, max_entries, max_chars)
+        else:
+            cid = int(branch_id.replace("conv_", ""))
+            entries = _get_lcm_content(lcm, cid, content_type, max_entries, max_chars)
         results.append({
             "branch_id": branch_id,
             "state": b["state"],
@@ -235,15 +442,30 @@ def do_conversation_content(branch_id=None, state=None, content_type="summaries"
     else:
         # Multi-branch mode (filtered by state or ALL)
         filter_state = (state or "ALL").upper()
-        if filter_state != "ALL":
-            branches = gdb.execute(
-                "SELECT branch_id, state, regime FROM branch_states WHERE state = ? ORDER BY node_count DESC",
-                (filter_state,)
-            ).fetchall()
+        if content_type == "logs":
+            if filter_state != "ALL":
+                branches = gdb.execute(
+                    "SELECT branch_id, state, regime FROM branch_states "
+                    "WHERE state = ? AND branch_id LIKE 'day_%' ORDER BY node_count DESC",
+                    (filter_state,),
+                ).fetchall()
+            else:
+                branches = gdb.execute(
+                    "SELECT branch_id, state, regime FROM branch_states "
+                    "WHERE branch_id LIKE 'day_%' ORDER BY node_count DESC"
+                ).fetchall()
         else:
-            branches = gdb.execute(
-                "SELECT branch_id, state, regime FROM branch_states ORDER BY node_count DESC"
-            ).fetchall()
+            if filter_state != "ALL":
+                branches = gdb.execute(
+                    "SELECT branch_id, state, regime FROM branch_states "
+                    "WHERE state = ? AND branch_id LIKE 'conv_%' ORDER BY node_count DESC",
+                    (filter_state,),
+                ).fetchall()
+            else:
+                branches = gdb.execute(
+                    "SELECT branch_id, state, regime FROM branch_states "
+                    "WHERE branch_id LIKE 'conv_%' ORDER BY node_count DESC"
+                ).fetchall()
 
         if not branches:
             gdb.close(); lcm.close()
@@ -251,8 +473,11 @@ def do_conversation_content(branch_id=None, state=None, content_type="summaries"
 
         per_branch = max(max_entries // len(branches), 3)
         for b in branches:
-            cid = int(b["branch_id"].replace("conv_", ""))
-            entries = _get_lcm_content(lcm, cid, content_type, per_branch, max_chars)
+            if str(b["branch_id"]).startswith("day_") or content_type == "logs":
+                entries = _get_daily_log_content(gdb, b["branch_id"], per_branch, max_chars)
+            else:
+                cid = int(b["branch_id"].replace("conv_", ""))
+                entries = _get_lcm_content(lcm, cid, content_type, per_branch, max_chars)
             results.append({
                 "branch_id": b["branch_id"],
                 "state": b["state"],
@@ -313,11 +538,11 @@ async def list_tools():
         ),
         Tool(
             name="branch_report",
-            description="Get detailed geometry metrics for a specific conversation branch (e.g. 'conv_186').",
+            description="Get detailed geometry metrics for a specific branch (e.g. 'conv_186' or 'day_2026-04-07').",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "branch_id": {"type": "string", "description": "Branch ID like 'conv_186'"}
+                    "branch_id": {"type": "string", "description": "Branch ID like 'conv_186' or 'day_YYYY-MM-DD'"}
                 },
                 "required": ["branch_id"]
             }
@@ -349,7 +574,7 @@ async def list_tools():
                     },
                     "content_type": {
                         "type": "string",
-                        "enum": ["summaries", "messages", "both"],
+                        "enum": ["summaries", "messages", "both", "logs"],
                         "description": "What to retrieve. Default: summaries (compact)."
                     },
                     "max_entries": {
@@ -383,6 +608,20 @@ async def call_tool(name, arguments):
             for i, c in enumerate(result['lcm']['conversations'], 1):
                 lines.append(f"  {i}. conv_{c['conv_id']} | {c['unique_keywords_matched']} kw matched | {c['total_matches']} total hits")
                 lines.append(f"     \"{c['best_snippet']}\"")
+            lines.append("")
+            lines.append(" DAILY LOGS (sidecar):")
+            sem_rows = result.get("daily_logs", {}).get("semantic_results", [])
+            kw_rows = result.get("daily_logs", {}).get("keyword_results", [])
+            if sem_rows:
+                lines.append("  Semantic:")
+                for i, r in enumerate(sem_rows, 1):
+                    lines.append(f"   {i}. {r['branch_id']} | sem={r['sem_score']} | {r['snippet']}")
+            if kw_rows:
+                lines.append("  Keyword:")
+                for i, r in enumerate(kw_rows, 1):
+                    lines.append(f"   {i}. {r['branch_id']} | kw={r['keyword_matched']} | {r['snippet']}")
+            if not sem_rows and not kw_rows:
+                lines.append("  (no daily-log matches)")
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "branch_report":
@@ -435,6 +674,8 @@ async def call_tool(name, arguments):
                 for e in r['content']:
                     if e['type'] == 'summary':
                         lines.append(f"\n  [{e['type'].upper()}/{e['kind']}] {e['text']}")
+                    elif e['type'] == 'daily_log':
+                        lines.append(f"\n  [DAILY_LOG/{e.get('source','manual_log')}] {e['text']}")
                     else:
                         lines.append(f"\n  [{e['role']}] {e['text']}")
                 lines.append("")

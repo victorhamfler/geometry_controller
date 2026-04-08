@@ -1,0 +1,22 @@
+{
+  "geo_db": "<openclaw_home>/lcm_geometry.db",
+  "lcm_db": "<openclaw_home>/lcm.db",
+  "embedding_model": "all-MiniLM-L6-v2",
+  "geometry_config": {
+    "retrieval_prefilter_limit": 256,
+    "retrieval_result_limit": 128,
+    "candidate_branch_cap": 10,
+    "candidate_prefilter_limit": 128,
+    "merge_execution_mode": "soft",
+    "merge_max_jobs_per_cycle": 5,
+    "merge_soft_edge_weight": 1.0,
+    "contradiction_sample_min_nodes": 64,
+    "contradiction_sample_max_nodes": 192,
+    "dormant_after_days": 14.0,
+    "dormant_usefulness_max": 0.2,
+    "dormant_min_nodes": 8,
+    "split_child_copy_usefulness": true,
+    "split_child_copy_retrieval_error": true,
+    "split_child_anchor_from_centroid": true
+  }
+}
