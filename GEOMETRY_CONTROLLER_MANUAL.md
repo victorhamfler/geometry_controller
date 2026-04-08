@@ -165,6 +165,8 @@ print(r['state'], r['regime'], r['eff_rank'], r['coherence'])
 | `compression_loss` | REAL | Compression error (reconstruction from low-rank) |
 | `contradiction_density` | REAL | Density of contradictory message pairs |
 | `retrieval_error` | REAL | EMA of retrieval mis-match scores |
+| `usefulness` | REAL | EMA usefulness score from retrieval feedback |
+| `reactivation_score` | REAL | Reactivation signal used for DORMANT -> REACTIVATING transitions |
 | `anchor` | BLOB (JSON bytes) | Stable reference centroid |
 | `anchor_drift` | REAL | Distance current mean_vec has drifted from anchor |
 | `node_count` | INT | Number of memory_nodes in this branch |
@@ -184,6 +186,11 @@ print(r['state'], r['regime'], r['eff_rank'], r['coherence'])
 | `timestamp` | REAL | When added |
 | `role` | TEXT | Message role: user, assistant, system |
 | `embedding` | BLOB (JSON bytes) | 384-dim vector as JSON list |
+| `update_mode` | TEXT | Per-node update intent metadata: `fork`, `attach`, `refine`, `contradict`, `supersede` |
+| `correction_kind` | TEXT | Version-flow label: `none`, `refine`, `contradict`, `supersede` |
+| `correction_prev_id` | TEXT | Previous node in explicit correction chain |
+| `correction_root_id` | TEXT | Stable root node ID for the correction chain |
+| `correction_version` | INTEGER | Monotonic version index inside correction chain |
 
 ### `memory_edges` — DAG Edges
 
@@ -191,7 +198,7 @@ print(r['state'], r['regime'], r['eff_rank'], r['coherence'])
 |--------|------|-------------|
 | `src_id` | TEXT | Source node |
 | `dst_id` | TEXT | Target node |
-| `edge_type` | TEXT | EdgeType: DERIVED_FROM, SUMMARIZES, REFINES, CONTRADICTS |
+| `edge_type` | TEXT | EdgeType: DERIVED_FROM, SUMMARIZES, REFINES, CONTRADICTS, SUPERSEDES |
 | `weight` | REAL | Edge weight (default 1.0) |
 
 ### `retrieval_feedback` — Retrieval Feedback Signals
@@ -258,6 +265,8 @@ Called after LCM persists a new message/summary. Computes CSD score against all 
 - `branch_id` — target branch ID
 - `csd_score` — CSD score for chosen branch
 - `conflict_score` — conflict metric for chosen branch
+- `update_mode` — metadata label for how the insert relates to branch history (`fork`, `attach`, `refine`, `contradict`, `supersede`)
+- `correction_*` — explicit correction-chain metadata for versioned factual updates
 - `rationale` — human-readable explanation
 
 **Example:**
@@ -271,20 +280,21 @@ decision = gc.on_new_item(
 )
 ```
 
-### `gc.rank_retrieval(query_emb, historical_use=None, same_project=None)`
+### `gc.rank_retrieval(query_emb, historical_use=None, same_project=None, retrieval_mode=None)`
 
 Rank all branches by relevance to a query embedding.
 
 - **`query_emb`** — numpy array, shape (384,)
 - **`historical_use`** — dict `branch_id → float` of past retrieval frequency
 - **`same_project`** — dict `branch_id → float` of same-project signal
+- **`retrieval_mode`** — `balanced` (default) | `factual` | `exploratory`
 
 **Returns:** list of `RetrievalCandidate` sorted by `total_score` descending:
 - `branch_id`
 - `sem_score` — cosine similarity to branch centroid
 - `trust_score` — composite of coherence, compression_loss, contradiction_density
 - `react_score` — reactivation signal
-- `total_score` — weighted composite: `α·sem + β·trust + δ·react`
+- `total_score` — weighted composite: `(α·sem + β·trust + δ·react) * mode_multiplier(state, regime)`
 
 ### `gc.branch_report(branch_id)`
 
@@ -294,7 +304,8 @@ Detailed geometry report for one branch.
 r = gc.branch_report('conv_1')
 # r.keys(): branch_id, state, regime, node_count, eff_rank, anisotropy,
 #           coherence, trace, anchor_drift, compression_loss,
-#           contradiction_density, retrieval_error, mean_vec (truncated)
+#           contradiction_density, retrieval_error, update_mode_counts,
+#           correction_counts, recent_corrections, mean_vec (truncated)
 ```
 
 ### `gc.run_maintenance_cycle()`
@@ -302,15 +313,16 @@ r = gc.branch_report('conv_1')
 Full maintenance sweep over all branches. Should be run periodically (every 20–30 min).
 
 **Operations per branch:**
-1. **Recomputes geometry** for each branch from its `memory_nodes` rows
-2. **Refreshes contradiction signals** (density + bounded `CONTRADICTS` edges)
-3. **Reclassifies regime** - PRODUCTIVE / RIGID / UNSTABLE
-4. **Applies dormancy policy** based on real branch activity age + usefulness thresholds
-5. **Scans for splits and prepares ranked candidates** when gate + hysteresis conditions are met
-6. **Scores merges with runtime signals** (graph overlap + retrieval co-use)
-7. **Executes pending split jobs** (k-means(2), child branches, `REFINES` edges + child priors)
-8. **Executes pending merge jobs** (soft merge mode: affinity edges + queue drain)
-9. **Runs reactivation scan**
+1. **Starts scalar-first scan** over `branch_states` and only full-loads branch blobs when needed
+2. **Recomputes geometry** for eligible branches from `memory_nodes` rows
+3. **Refreshes contradiction signals** (density + bounded `CONTRADICTS` edges)
+4. **Reclassifies regime** - PRODUCTIVE / RIGID / UNSTABLE
+5. **Applies dormancy policy** based on real branch activity age + usefulness thresholds
+6. **Scans for splits and prepares ranked candidates** when gate + hysteresis conditions are met
+7. **Scores merges with runtime signals** (graph overlap + retrieval co-use)
+8. **Executes pending split jobs** (k-means(2), child branches, `REFINES` edges + child priors)
+9. **Executes pending merge jobs** (soft merge mode: affinity edges + queue drain)
+10. **Runs reactivation scan**
 
 **Returns:** `dict` with counts:
 ```python
@@ -380,7 +392,11 @@ gc = GeometryController('/path/to/lcm_geometry.db', cfg=cfg)
 | `min_branch_size` | 8 | Don't compute stats below this |
 | `stat_rho` | 0.05 | EMA rate for geometry field updates |
 | `anchor_alpha` | 0.01 | Anchor update rate |
-| `attach_threshold` | 0.50 | CSD below this → attach; above → tension/fork |
+| `attach_threshold` | 0.50 | Global fallback attach threshold |
+| `tension_threshold` | 0.70 | Global fallback tension threshold |
+| `attach_threshold_by_type` | `{"default": 0.50}` | Optional per-branch-type attach threshold overrides |
+| `tension_threshold_by_type` | `{"default": 0.70}` | Optional per-branch-type tension threshold overrides |
+| `branch_type_profiles` | dict | Optional per-branch metric profiles (`csd_gamma`, `retrieval_kappa`, `split_zeta`, `split_policy`, `merge_eta`, `merge_policy`) |
 | `alpha_sem` | 0.60 | Semantic similarity weight in retrieval |
 | `beta_trust` | 0.25 | Trust score weight in retrieval |
 | `delta_react` | 0.15 | Reactivation weight in retrieval |
@@ -398,6 +414,8 @@ gc = GeometryController('/path/to/lcm_geometry.db', cfg=cfg)
 | `usefulness_lambda` | 0.10 | EMA decay for usefulness signals |
 | `retrieval_prefilter_limit` | 256 | Max branches in scalar retrieval prefilter shortlist |
 | `retrieval_result_limit` | 128 | Max retrieval candidates returned |
+| `retrieval_mode_default` | `balanced` | Default retrieval routing mode (`balanced`/`factual`/`exploratory`) |
+| `retrieval_mode_factors` | dict | Regime/state multipliers applied per retrieval mode |
 | `candidate_prefilter_limit` | 128 | Max branches inspected by scalar prefilter for `on_new_item` |
 | `candidate_branch_cap` | 10 | Max full branches loaded for final allocation scoring |
 | `contradiction_sample_min_nodes` | 64 | Minimum sample target for contradiction compute on large branches |
@@ -405,6 +423,21 @@ gc = GeometryController('/path/to/lcm_geometry.db', cfg=cfg)
 | `dormant_after_days` | 14.0 | Activity age threshold to mark dormant |
 | `dormant_usefulness_max` | 0.20 | Dormancy requires usefulness at/below this value |
 | `dormant_min_nodes` | 8 | Minimum branch size before dormancy policy applies |
+| `protected_branch_types` | list[str] | Protected branch classes for hard attach/merge gates |
+| `protected_attach_conflict_threshold` | 0.35 | Protected attach conflict gate |
+| `protected_attach_contradiction_threshold` | 0.20 | Protected attach contradiction-density gate |
+| `protected_merge_block` | True | If true, blocks merge queueing when either branch is protected |
+| `protected_merge_contradiction_threshold` | 0.20 | Alternative contradiction-based protected merge gate |
+| `reactivation_min_score` | 0.60 | Minimum reactivation score before wake transitions |
+| `reactivation_guard_enabled` | True | Enables contradiction/error/similarity checks before wake |
+| `reactivation_max_contradiction` | 0.35 | Wake blocked above this contradiction density |
+| `reactivation_max_retrieval_error` | 0.60 | Wake blocked above this retrieval error |
+| `reactivation_min_similarity` | 0.15 | Query-to-branch similarity floor for relevance-triggered wake |
+| `update_mode_refine_similarity_min` | 0.92 | Similarity floor for labeling node updates as `refine` |
+| `update_mode_contradict_conflict_min` | 0.25 | Conflict floor for labeling updates as `contradict` |
+| `update_mode_supersede_similarity_min` | 0.78 | Similarity floor for `supersede` classification |
+| `update_mode_supersede_conflict_min` | 0.70 | Conflict floor for `supersede` classification |
+| `update_mode_supersede_branch_types` | list[str] | Branch types eligible for `supersede` classification |
 | `rank_target` | dict | eff_rank target bands per branch type |
 | `rigid_rank_ratio` | 0.15 | eff_rank below this → RIGID regime |
 | `unstable_coh_floor` | 0.45 | Coherence below this → UNSTABLE |
@@ -488,19 +521,20 @@ The scorer uses EMA-weighted residuals so one-off outliers don't destabilise sta
 
 Run `gc.run_maintenance_cycle()` every 20–30 minutes. It:
 
-1. **Recomputes geometry** for each branch from its `memory_nodes` rows
-2. **Updates scalars** (eff_rank, anisotropy, coherence, trace) via adiabatic EMA
-3. **Reclassifies regime** — PRODUCTIVE / RIGID / UNSTABLE
-4. **Applies dormancy policy** — inactive + low-usefulness branches move to `DORMANT`
-5. **Scans for splits** — branch must pass:
+1. **Starts scalar-first** from `branch_states` and updates scalar metrics without loading full blobs when possible
+2. **Recomputes geometry** for branch subsets that pass recompute gates
+3. **Updates scalars** (eff_rank, anisotropy, coherence, trace) via adiabatic EMA
+4. **Reclassifies regime** — PRODUCTIVE / RIGID / UNSTABLE
+5. **Applies dormancy policy** — inactive + low-usefulness branches move to `DORMANT`
+6. **Scans for splits** — branch must pass:
    - score gate: `split_score > split_score_threshold`
    - node readiness gate: `node_count >= max(split_min_nodes, min_branch_size)`
    - real-node readiness gate: embedded rows also meet the same threshold
    - hysteresis gate: `split_counter >= split_hysteresis`
    Eligible branches are score-ranked and throttled by `max_split_enqueues_per_cycle`.
-6. **Scans for merges** — stable/dormant branches with high topic overlap → `MERGE_CANDIDATE`
-7. **Executes pending split jobs** — children inherit key priors and centroid-seeded anchors
-8. **Executes pending merge jobs** — in `soft` mode, writes SAME_TOPIC affinity edges and drains queue
+7. **Scans for merges** — stable/dormant branches with high topic overlap → `MERGE_CANDIDATE`
+8. **Executes pending split jobs** — children inherit key priors and centroid-seeded anchors
+9. **Executes pending merge jobs** — in `soft` mode, writes SAME_TOPIC affinity edges and drains queue
 
 ### Running as Cron
 
@@ -589,14 +623,14 @@ These edges enable:
 
 ## 12. MCP Server Tools
 
-The OpenClaw MCP server (`<openclaw_home>/extensions/geometry-mcp/server.py`) exposes four tools:
+The OpenClaw MCP server (`<openclaw_home>/extensions/geometry-mcp/server.py`) exposes five tools:
 
 ### `geometry-hybrid__hybrid_search`
 
 Combines LCM keyword search with geometry DB semantic search. Best for open-ended recall.
 
 ```
-geometry-hybrid__hybrid_search(query="CLGK dashboard", top_n=5)
+geometry-hybrid__hybrid_search(query="CLGK dashboard", top_n=5, retrieval_mode="factual")
 ```
 
 Returns combined results from both systems with recommendation.
@@ -609,7 +643,7 @@ Detailed geometry metrics for one branch.
 geometry-hybrid__branch_report(branch_id="conv_1")
 ```
 
-Returns: state, regime, node_count, eff_rank, anisotropy, coherence, trace, anchor_drift, mean_vec (first 10 dims), compression_loss, contradiction_density, retrieval_error.
+Returns: state, regime, node_count, eff_rank, anisotropy, coherence, trace, anchor_drift, mean_vec (first 10 dims), compression_loss, contradiction_density, retrieval_error, update/correction summaries.
 
 ### `geometry-hybrid__geometry_stats`
 
@@ -620,6 +654,16 @@ geometry-hybrid__geometry_stats()
 ```
 
 Returns: branch count, state distribution, regime distribution, average metrics.
+
+### `geometry-hybrid__sync_lcm_ingest`
+
+Force one incremental ingest poll from `lcm.db` into `lcm_geometry.db`.
+
+```
+geometry-hybrid__sync_lcm_ingest(limit=200)
+```
+
+Returns: processed/failed counters, rowid cursor movement, and `has_more`.
 
 ### `geometry-hybrid__conversation_content`
 
@@ -636,7 +680,7 @@ geometry-hybrid__conversation_content(
 Supports:
 - `branch_id="conv_N"` for one conversation
 - `state="ACTIVE" | "STABLE" | "FORMING" | "ALL"` for batch mode
-- `content_type="summaries" | "messages" | "both"`
+- `content_type="summaries" | "messages" | "both" | "logs"`
 
 ### MCP Server Registration
 
@@ -661,7 +705,9 @@ Optional runtime tuning for MCP:
 cp <module_repo_root>/extensions/geometry-mcp/runtime_config.example.json \
    <openclaw_home>/extensions/geometry-mcp/runtime_config.json
 ```
-2. Edit `runtime_config.json` (`geometry_config` section).
+2. Edit `runtime_config.json`:
+   - top-level `polling` section for real-time ingest
+   - `geometry_config` section for controller policy tuning
 3. Restart gateway.  
 The server also supports env override `GEOMETRY_RUNTIME_CONFIG_JSON` (JSON object).
 
@@ -706,6 +752,20 @@ The current controller build includes these production features:
 14. **Bounded contradiction compute** via temporal stratified sampling on large branches.
 15. **Dormancy lifecycle policy** based on real activity age + usefulness.
 16. **Split child priors** (usefulness/retrieval_error inheritance + centroid anchor seeding).
+17. **Branch-type aware allocation thresholds** with global fallback.
+18. **Scalar-first maintenance persistence** to reduce blob I/O.
+19. **Connect-time schema migration** for `reactivation_score`.
+20. **Protected-memory hard gates** for attach/fork and merge queueing.
+21. **Safe reactivation guard** using contradiction/retrieval-error/similarity checks.
+22. **Regime-aware retrieval routing** via `balanced`/`factual`/`exploratory` mode multipliers.
+23. **Branch-type metric profiles** for CSD/retrieval/split/merge sensitivity tuning.
+24. **Versioned correction flow** with explicit `REFINES`/`CONTRADICTS`/`SUPERSEDES` lineage metadata.
+25. **Duplicate-safe polling ingest + lag telemetry**:
+    - skips previously-ingested message `lcm_id` values in incremental polling
+    - exposes `skipped_duplicates`, `lag_rows`, and cursor/max-rowid status via MCP ingest reporting
+26. **Optional duplicate cleanup utility**:
+    - `scripts/cleanup_geometry_duplicates.py` for one-time repair of legacy duplicate-ingest inflation
+    - creates backup, dedupes message rows, rebuilds affected edges/metadata, and can run one maintenance cycle
 
 ---
 
@@ -764,6 +824,23 @@ Then check status:
 ```bash
 openclaw gateway status
 openclaw mcp list
+```
+
+### Historical duplicate message rows in geometry DB
+
+If a legacy DB was built before duplicate-safe polling, you may see inflated message counts.
+
+Run recovery dry-run:
+```bash
+python3 scripts/cleanup_geometry_duplicates.py --db <openclaw_home>/lcm_geometry.db
+```
+
+Apply (creates backup automatically) + refresh:
+```bash
+python3 scripts/cleanup_geometry_duplicates.py \
+  --db <openclaw_home>/lcm_geometry.db \
+  --apply \
+  --run-maintenance
 ```
 
 ### Maintenance cycle not recomputing all branches

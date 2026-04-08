@@ -8,6 +8,7 @@ Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geomet
   - retrieval prefilter by branch scalars (`retrieval_prefilter_limit`)
   - candidate prefilter for `on_new_item(...)` (`candidate_prefilter_limit`, `candidate_branch_cap`)
   - `health_report()` now uses scalar scan instead of full geometry blob load
+  - `run_maintenance_cycle()` now starts from scalar scans and only full-loads branch blobs when required
 - Added merge execution pipeline (safe mode):
   - `execute_pending_merges(...)` wired into maintenance
   - `merge_execution_mode="soft"` creates `SAME_TOPIC` affinity edges and drains merge queue
@@ -22,6 +23,36 @@ Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geomet
   - child branches inherit parent `usefulness` and `retrieval_error`
   - child anchor can be seeded from split cluster centroid
   - controlled by `split_child_copy_*` options
+- Added branch-type aware allocation thresholds:
+  - `attach_threshold_by_type` and `tension_threshold_by_type`
+  - falls back to global `attach_threshold` / `tension_threshold`
+- Added per-node update-mode classification metadata:
+  - `update_mode` persisted on `memory_nodes` (`fork` / `attach` / `refine` / `contradict` / `supersede`)
+  - branch report now includes `update_mode_counts`
+  - configurable via `update_mode_*` runtime keys
+- Added versioned correction flow (conflicting-fact lineage):
+  - `memory_nodes` now persists `correction_kind`, `correction_prev_id`, `correction_root_id`, `correction_version`
+  - explicit correction edges are written: `refines`, `contradicts`, `supersedes`
+  - branch report now includes `correction_counts` and `recent_corrections`
+- Added real-time incremental LCM polling in MCP server:
+  - cursor-based ingest using `poll_lcm_for_new_items(...)` on tool calls (cooldown + lock)
+  - duplicate-safe ingest path skips already-seen message `lcm_id` values (`skipped_duplicates`)
+  - polling status now exposes lag telemetry (`lag_rows`, `lcm_max_rowid`, `cursor_rowid`)
+  - manual force-sync MCP tool: `sync_lcm_ingest`
+  - polling behavior configurable via top-level `polling` config block
+- Added safe schema migration for lifecycle persistence:
+  - auto-adds `reactivation_score` column on existing DBs when missing
+- Added protected-memory hard gates:
+  - protected branch types can force `fork` on high conflict/contradiction
+  - protected merges can be blocked by policy
+- Added safe reactivation guard:
+  - `DORMANT -> REACTIVATING` now checks contradiction/error/similarity gates
+- Added regime-aware retrieval routing:
+  - retrieval modes `balanced` / `factual` / `exploratory`
+  - mode profiles weight branch `state` + `regime` during ranking
+- Added branch-type metric profiles:
+  - optional `branch_type_profiles` lets branch classes override CSD/retrieval/split/merge weights
+  - default behavior is unchanged when no profile is configured
 - MCP server now supports runtime config file/env overrides:
   - `extensions/geometry-mcp/runtime_config.json`
   - `GEOMETRY_RUNTIME_CONFIG_JSON`
@@ -32,6 +63,10 @@ Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geomet
 - `lcm_geometry_backfill.py` - builds/refreshes `lcm_geometry.db` from `lcm.db`
 - `extensions/geometry-mcp/server.py` - MCP server exposing geometry tools to OpenClaw agents
 - `scripts/smoke_test_geometry.py` - fast local smoke test
+- `scripts/run_update_mode_regression.py` - deterministic update-mode regression (`fork/refine/contradict/supersede`)
+- `scripts/run_polling_regression.py` - deterministic incremental polling regression (cursor + conv mapping)
+- `scripts/run_ml_split_regression.py` - end-to-end backfill + split-maintenance regression on real `lcm.db`
+- `scripts/cleanup_geometry_duplicates.py` - optional one-time DB repair utility for historical duplicate message ingest rows
 - `GEOMETRY_CONTROLLER_MANUAL.md` - full technical manual
 - `GEOMETRY_MODULE_TUTORIAL.md` - practical usage tutorial
 
@@ -55,7 +90,17 @@ pip install -r requirements.txt
 ```bash
 python3 scripts/smoke_test_geometry.py
 # expected: SMOKE_OK ...
+python3 scripts/run_update_mode_regression.py
+# expected: UPDATE_MODE_REGRESSION_OK
+python3 scripts/run_polling_regression.py
+# expected: POLLING_REGRESSION_OK ...
+# optional (heavier, real lcm.db regression):
+# python3 scripts/run_ml_split_regression.py --max-per-conv 40 --cycles 1
+# optional (recovery-only): duplicate cleanup dry-run
+# python3 scripts/cleanup_geometry_duplicates.py --db <openclaw_home>/lcm_geometry.db
 ```
+
+`cleanup_geometry_duplicates.py` is not part of normal operation. Use it only if a legacy DB shows inflated duplicate message rows from older polling runs.
 
 ## Deploy files to OpenClaw
 
@@ -119,6 +164,16 @@ The MCP server automatically loads runtime overrides from:
 - `<openclaw_home>/extensions/geometry-mcp/runtime_config.json` (if present)
 - env var `GEOMETRY_RUNTIME_CONFIG_JSON` (JSON object; merged on top)
 
+Top-level runtime block (outside `geometry_config`):
+
+- `polling.enabled`
+- `polling.interval_seconds`
+- `polling.limit`
+- `polling.conversation_id`
+- `polling.cursor_path`
+- `polling.show_status`
+- `polling.debug_log`
+
 Useful keys in `geometry_config`:
 
 - Retrieval/lazy loading:
@@ -126,6 +181,34 @@ Useful keys in `geometry_config`:
   - `retrieval_result_limit`
   - `candidate_prefilter_limit`
   - `candidate_branch_cap`
+- Retrieval routing:
+  - `retrieval_mode_default`
+  - `retrieval_mode_factors`
+- Allocation thresholds (branch-type aware):
+  - `attach_threshold`
+  - `tension_threshold`
+  - `attach_threshold_by_type`
+  - `tension_threshold_by_type`
+- Branch-type metric profiles:
+  - `branch_type_profiles`
+  - groups supported: `csd_gamma`, `retrieval_kappa`, `split_zeta`, `split_policy`, `merge_eta`, `merge_policy`
+- Protected memory + safe reactivation:
+  - `protected_branch_types`
+  - `protected_attach_conflict_threshold`
+  - `protected_attach_contradiction_threshold`
+  - `protected_merge_block`
+  - `protected_merge_contradiction_threshold`
+  - `reactivation_min_score`
+  - `reactivation_guard_enabled`
+  - `reactivation_max_contradiction`
+  - `reactivation_max_retrieval_error`
+  - `reactivation_min_similarity`
+- Update-mode metadata classification:
+  - `update_mode_refine_similarity_min`
+  - `update_mode_contradict_conflict_min`
+  - `update_mode_supersede_similarity_min`
+  - `update_mode_supersede_conflict_min`
+  - `update_mode_supersede_branch_types`
 - Merge execution:
   - `merge_execution_mode` (`soft` or `off`)
   - `merge_max_jobs_per_cycle`
@@ -144,9 +227,10 @@ Useful keys in `geometry_config`:
 
 ## MCP tools provided
 
-- `hybrid_search` - combined semantic + keyword retrieval with recommendation (`geometry` / `lcm` / `both`)
+- `hybrid_search` - combined semantic + keyword retrieval with recommendation (`geometry` / `lcm` / `both`), now with optional `retrieval_mode` (`balanced` / `factual` / `exploratory`)
 - `branch_report` - branch diagnostics (state, regime, rank/coherence/anisotropy, etc.)
 - `geometry_stats` - global DB health and distribution stats
+- `sync_lcm_ingest` - force one incremental ingest poll from `lcm.db` into geometry DB
 - `conversation_content` - geometry-to-LCM text bridge (summaries/messages by branch/state)
 
 ## Typical usage flow

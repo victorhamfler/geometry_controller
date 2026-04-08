@@ -38,14 +38,24 @@ Current runtime uses inactivity + usefulness policy to move ACTIVE/STABLE/TENSIO
 
 ## 3. MCP tools
 
-Use these 4 tools exposed by `geometry-hybrid`:
+Use these 5 tools exposed by `geometry-hybrid`:
 
 - `geometry-hybrid__hybrid_search`: combined semantic + keyword ranking.
 - `geometry-hybrid__conversation_content`: read summaries/messages for a branch (`conv_*`).
-- `geometry-hybrid__branch_report`: inspect one branch (state/regime/metrics).
+- `geometry-hybrid__branch_report`: inspect one branch (state/regime/metrics + `update_mode_counts`).
 - `geometry-hybrid__geometry_stats`: global geometry DB health metrics.
+- `geometry-hybrid__sync_lcm_ingest`: force one incremental LCM->geometry ingest poll.
 
 Recommended flow: `hybrid_search` -> `branch_report` (if needed) -> `conversation_content`.
+
+`sync_lcm_ingest` output now includes:
+- `skipped_duplicates` (already-ingested messages in requested row window)
+- `lag_rows` + rowid cursor status (`next_rowid` vs `lcm_max_rowid`)
+
+For `hybrid_search`, use:
+- `retrieval_mode="factual"` when precision/reliability matters.
+- `retrieval_mode="exploratory"` when broad discovery matters.
+- `retrieval_mode="balanced"` for normal usage.
 
 ---
 
@@ -64,10 +74,15 @@ Recommended flow: `hybrid_search` -> `branch_report` (if needed) -> `conversatio
 |---|---|---|
 | `embedding_dim` | `384` | Embedding vector size, must match model output |
 | `min_branch_size` | `8` | Minimum rows for full geometry recompute |
-| `attach_threshold` | `0.50` | CSD below this -> `attach` |
-| `tension_threshold` | `0.70` | CSD in `[attach_threshold, tension_threshold)` -> `attach_tension`; above -> `fork` |
+| `attach_threshold` | `0.50` | Global fallback attach threshold |
+| `tension_threshold` | `0.70` | Global fallback tension threshold |
+| `attach_threshold_by_type` | `{"default":0.5}` | Optional per-branch-type attach threshold map |
+| `tension_threshold_by_type` | `{"default":0.7}` | Optional per-branch-type tension threshold map (must be >= attach threshold) |
+| `branch_type_profiles` | `{...}` | Optional per-branch metric profile overrides (`csd_gamma`, `retrieval_kappa`, `split_zeta`, `split_policy`, `merge_eta`, `merge_policy`) |
 | `alpha_sem` | `0.60` | Semantic weight in retrieval ranking |
 | `beta_trust` | `0.25` | Trust/quality weight in retrieval ranking |
+| `retrieval_mode_default` | `"balanced"` | Default retrieval routing mode (`balanced`, `factual`, `exploratory`) |
+| `retrieval_mode_factors` | `{...}` | Regime/state multipliers per retrieval mode |
 | `split_score_threshold` | `0.075` | Split score gate threshold |
 | `split_min_nodes` | `6` | Baseline split gate; effective readiness uses `max(split_min_nodes, min_branch_size)` |
 | `max_split_enqueues_per_cycle` | `5` | Maximum split jobs queued in one maintenance cycle (highest scores first) |
@@ -78,6 +93,23 @@ Recommended flow: `hybrid_search` -> `branch_report` (if needed) -> `conversatio
 | `contradiction_sample_max_nodes` | `192` | Cap contradiction matrix size for large branches (`0` disables cap) |
 | `dormant_after_days` | `14.0` | Inactivity threshold for dormancy |
 | `dormant_usefulness_max` | `0.20` | Branch usefulness must be below this to become dormant |
+| `protected_branch_types` | `["identity","user_fact",...]` | Branch types with hard attach/merge protection |
+| `protected_attach_conflict_threshold` | `0.35` | Conflict gate for protected attach |
+| `protected_attach_contradiction_threshold` | `0.20` | Contradiction-density gate for protected attach |
+| `reactivation_guard_enabled` | `true` | Enable safe reactivation checks |
+| `reactivation_min_score` | `0.60` | Minimum reactivation score before wake |
+| `reactivation_max_contradiction` | `0.35` | Max contradiction allowed for wake |
+| `reactivation_max_retrieval_error` | `0.60` | Max retrieval error allowed for wake |
+| `reactivation_min_similarity` | `0.15` | Min semantic similarity for relevance-triggered wake |
+| `update_mode_refine_similarity_min` | `0.92` | Similarity floor to classify node insertions as `refine` |
+| `update_mode_contradict_conflict_min` | `0.25` | Conflict floor to classify insertions as `contradict` |
+| `update_mode_supersede_similarity_min` | `0.78` | Similarity floor for `supersede` classification |
+| `update_mode_supersede_conflict_min` | `0.70` | Conflict floor for `supersede` classification |
+| `update_mode_supersede_branch_types` | `["identity","user_fact",...]` | Branch types eligible for `supersede` |
+| `polling.enabled` *(top-level)* | `true` | Enable automatic incremental ingest on tool calls |
+| `polling.interval_seconds` *(top-level)* | `8` | Cooldown between automatic ingest polls |
+| `polling.limit` *(top-level)* | `200` | Max messages ingested per poll |
+| `polling.cursor_path` *(top-level)* | `<openclaw_home>/.../poll_cursor.json` | Persistent rowid cursor path |
 | `split_child_copy_usefulness` | `true` | Split children inherit parent usefulness |
 | `split_child_anchor_from_centroid` | `true` | Split children seed anchor from cluster centroid |
 
@@ -153,6 +185,7 @@ This preserves a rowid cursor and processes only new messages.
 ## 8. Operating tips
 
 - Run `run_maintenance_cycle()` periodically (for example every 20-30 minutes).
+- Maintenance is scalar-first: branch blobs are only loaded when full recompute/merge vectors are needed.
 - Use `resume=True` for incremental backfill runs.
 - Check `split_trace_run_id` and `split_observations` from maintenance output when validating split behavior.
 - Use `gc.health_report()` for quick state/regime and pending-job visibility.

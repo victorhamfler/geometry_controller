@@ -50,10 +50,39 @@ This project adds a semantic geometry layer on top of OpenClaw LCM memory.
   - cross-agent links (`mark_branch_agent_interest`, `add_cross_agent_shared_edge`, `list_cross_agent_links`)
 - Performance/runtime hardening:
   - scalar/lazy branch loading for retrieval and allocation prefilter
+  - scalar-first maintenance persistence (full blobs loaded only when needed)
   - bounded contradiction compute for large branches (temporal stratified sampling)
   - merge execution pipeline (`soft` mode) with queue drain
   - dormancy policy based on inactivity + usefulness
   - split child prior propagation (usefulness/retrieval_error + centroid anchor seed)
+- Allocation policy hardening:
+  - branch-type aware CSD thresholds (`attach_threshold_by_type`, `tension_threshold_by_type`)
+  - fallback to global thresholds (`attach_threshold`, `tension_threshold`)
+- Retrieval policy hardening:
+  - retrieval modes (`balanced`, `factual`, `exploratory`)
+  - regime/state-aware ranking multipliers per mode
+- Branch-type metric profiles:
+  - optional per-branch class weight profiles for CSD, retrieval trust/react, split, and merge
+  - default path remains unchanged without profile config
+- Protected memory safety gates:
+  - protected branch types can force fork on risky attach
+  - protected merge queueing can be blocked by policy
+- Safe reactivation:
+  - wake transitions gated by contradiction density, retrieval error, and optional similarity checks
+- Schema compatibility:
+  - connect-time migration keeps legacy DBs compatible by auto-adding `reactivation_score`
+- Update-mode observability:
+  - each inserted node is labeled with `update_mode` (`fork`, `attach`, `refine`, `contradict`, `supersede`)
+  - branch diagnostics include per-mode counters (`update_mode_counts`)
+  - runtime thresholds configurable via `update_mode_*` keys
+- Versioned correction flow:
+  - nodes persist correction lineage (`correction_kind`, `correction_prev_id`, `correction_root_id`, `correction_version`)
+  - explicit relation edges now include `SUPERSEDES` in addition to `REFINES` / `CONTRADICTS`
+- MCP real-time ingest wiring:
+  - automatic incremental poll from `lcm.db` on tool calls (cooldown + persistent rowid cursor)
+  - manual force tool: `sync_lcm_ingest`
+  - duplicate-safe polling path (skips existing message ids)
+  - polling lag telemetry (`lag_rows`, `cursor_rowid`, `lcm_max_rowid`)
 - Runtime config support in MCP server:
   - optional `extensions/geometry-mcp/runtime_config.json`
   - env override `GEOMETRY_RUNTIME_CONFIG_JSON`

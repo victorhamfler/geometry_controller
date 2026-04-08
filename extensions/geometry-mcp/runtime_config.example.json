@@ -2,11 +2,192 @@
   "geo_db": "<openclaw_home>/lcm_geometry.db",
   "lcm_db": "<openclaw_home>/lcm.db",
   "embedding_model": "all-MiniLM-L6-v2",
+  "polling": {
+    "enabled": true,
+    "interval_seconds": 8,
+    "limit": 200,
+    "conversation_id": null,
+    "cursor_path": "<openclaw_home>/extensions/geometry-mcp/poll_cursor.json",
+    "show_status": true,
+    "debug_log": false
+  },
   "geometry_config": {
     "retrieval_prefilter_limit": 256,
     "retrieval_result_limit": 128,
     "candidate_branch_cap": 10,
     "candidate_prefilter_limit": 128,
+    "retrieval_mode_default": "balanced",
+    "retrieval_mode_factors": {
+      "balanced": {
+        "regime": {
+          "PRODUCTIVE": 1.05,
+          "RIGID": 0.95,
+          "UNSTABLE": 0.85
+        },
+        "state": {
+          "REACTIVATING": 1.03,
+          "DORMANT": 0.92,
+          "TENSIONED": 0.9,
+          "FORMING": 0.9
+        }
+      },
+      "factual": {
+        "regime": {
+          "PRODUCTIVE": 1.1,
+          "RIGID": 0.9,
+          "UNSTABLE": 0.6
+        },
+        "state": {
+          "STABLE": 1.05,
+          "ACTIVE": 1.0,
+          "REACTIVATING": 0.95,
+          "DORMANT": 0.85,
+          "TENSIONED": 0.75,
+          "FORMING": 0.8
+        }
+      },
+      "exploratory": {
+        "regime": {
+          "PRODUCTIVE": 1.0,
+          "RIGID": 0.92,
+          "UNSTABLE": 0.95
+        },
+        "state": {
+          "REACTIVATING": 1.08,
+          "ACTIVE": 1.02,
+          "DORMANT": 0.96,
+          "TENSIONED": 0.95,
+          "STABLE": 0.98
+        }
+      }
+    },
+    "attach_threshold": 0.5,
+    "tension_threshold": 0.7,
+    "attach_threshold_by_type": {
+      "default": 0.5,
+      "broad_history": 0.5,
+      "project_task": 0.45,
+      "daily_log": 0.55
+    },
+    "tension_threshold_by_type": {
+      "default": 0.7,
+      "broad_history": 0.7,
+      "project_task": 0.65,
+      "daily_log": 0.75
+    },
+    "branch_type_profiles": {
+      "project_task": {
+        "csd_gamma": {
+          "conflict": 0.3,
+          "sem": 0.2
+        },
+        "retrieval_kappa": {
+          "coherence": 0.35,
+          "ret_error": 0.35
+        },
+        "split_policy": {
+          "threshold": 0.08
+        }
+      },
+      "daily_log": {
+        "split_zeta": {
+          "incoherence": 0.05,
+          "anisotropy": 0.05,
+          "comp_loss": 0.05,
+          "ret_error": 0.05,
+          "contradiction": 0.05
+        },
+        "merge_policy": {
+          "threshold": 1.2
+        }
+      },
+      "user_fact": {
+        "csd_gamma": {
+          "conflict": 0.35
+        },
+        "retrieval_kappa": {
+          "contradiction": -0.4,
+          "ret_error": -0.35
+        },
+        "merge_policy": {
+          "threshold": 1.0
+        }
+      },
+      "conversation": {
+        "csd_gamma": {
+          "sem": 0.18,
+          "conflict": 0.22
+        },
+        "retrieval_kappa": {
+          "coherence": 0.34,
+          "comp_loss": -0.12,
+          "contradiction": -0.18,
+          "ret_error": -0.2,
+          "hist": 0.22
+        },
+        "split_policy": {
+          "threshold": 0.085,
+          "hysteresis": 3
+        },
+        "merge_eta": {
+          "topic": 0.24,
+          "co_use": 0.18
+        },
+        "merge_policy": {
+          "threshold": 0.58
+        }
+      },
+      "broad_history": {
+        "csd_gamma": {
+          "sem": 0.14,
+          "conflict": 0.28
+        },
+        "retrieval_kappa": {
+          "coherence": 0.28,
+          "comp_loss": -0.1,
+          "contradiction": -0.24,
+          "ret_error": -0.28,
+          "hist": 0.18
+        },
+        "split_policy": {
+          "threshold": 0.095,
+          "hysteresis": 4
+        },
+        "merge_eta": {
+          "topic": 0.18,
+          "co_use": 0.12
+        },
+        "merge_policy": {
+          "threshold": 0.65
+        }
+      }
+    },
+    "protected_branch_types": [
+      "identity",
+      "user_fact",
+      "user_preference",
+      "preference",
+      "daily_log"
+    ],
+    "protected_attach_conflict_threshold": 0.35,
+    "protected_attach_contradiction_threshold": 0.2,
+    "protected_merge_block": true,
+    "protected_merge_contradiction_threshold": 0.2,
+    "reactivation_min_score": 0.6,
+    "reactivation_guard_enabled": true,
+    "reactivation_max_contradiction": 0.35,
+    "reactivation_max_retrieval_error": 0.6,
+    "reactivation_min_similarity": 0.15,
+    "update_mode_refine_similarity_min": 0.92,
+    "update_mode_contradict_conflict_min": 0.25,
+    "update_mode_supersede_similarity_min": 0.78,
+    "update_mode_supersede_conflict_min": 0.7,
+    "update_mode_supersede_branch_types": [
+      "identity",
+      "user_fact",
+      "user_preference",
+      "preference"
+    ],
     "merge_execution_mode": "soft",
     "merge_max_jobs_per_cycle": 5,
     "merge_soft_edge_weight": 1.0,

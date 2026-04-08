@@ -17,6 +17,8 @@ Usage:
 import sys
 import os
 import json
+import time
+import threading
 
 # Resolve workspace/module path  going up from extensions/geometry-mcp/  extensions/  ~/.openclaw/
 SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -80,16 +82,32 @@ EMBED_MODEL_NAME = str(_RUNTIME_CFG.get("embedding_model") or "all-MiniLM-L6-v2"
 _GEOMETRY_CFG_OVERRIDES = _RUNTIME_CFG.get("geometry_config", {})
 if not isinstance(_GEOMETRY_CFG_OVERRIDES, dict):
     _GEOMETRY_CFG_OVERRIDES = {}
+_POLLING_CFG = _RUNTIME_CFG.get("polling", {})
+if not isinstance(_POLLING_CFG, dict):
+    _POLLING_CFG = {}
+
+POLLING_ENABLED = bool(_POLLING_CFG.get("enabled", True))
+POLLING_INTERVAL_SEC = float(_POLLING_CFG.get("interval_seconds", 8.0))
+POLLING_LIMIT = int(_POLLING_CFG.get("limit", 200))
+POLLING_CONVERSATION_ID = _POLLING_CFG.get("conversation_id")
+POLLING_CURSOR_PATH = str(
+    _POLLING_CFG.get("cursor_path") or os.path.join(SKILL_DIR, "poll_cursor.json")
+)
+POLLING_SHOW_STATUS = bool(_POLLING_CFG.get("show_status", True))
+POLLING_DEBUG_LOG = bool(_POLLING_CFG.get("debug_log", False))
 
 print(
     f"[geometry-mcp] runtime cfg loaded: geo_db={GEO_DB} lcm_db={LCM_DB} "
-    f"model={EMBED_MODEL_NAME} geometry_overrides={len(_GEOMETRY_CFG_OVERRIDES)}",
+    f"model={EMBED_MODEL_NAME} geometry_overrides={len(_GEOMETRY_CFG_OVERRIDES)} "
+    f"polling_enabled={POLLING_ENABLED} interval={POLLING_INTERVAL_SEC}s limit={POLLING_LIMIT}",
     file=sys.stderr,
 )
 
 #  Lazy-load heavy libs 
 _model = None
 _gc = None
+_poll_lock = threading.Lock()
+_last_poll_ts = 0.0
 
 def get_model():
     global _model
@@ -101,7 +119,11 @@ def get_model():
 def get_gc():
     global _gc
     if _gc is None:
-        from lcm_geometry_controller import GeometryController, GeometryConfig
+        from lcm_geometry_controller import GeometryController, GeometryConfig, EmbeddingProvider
+        provider = EmbeddingProvider(
+            model_name=EMBED_MODEL_NAME,
+            device=str(os.getenv("GEOMETRY_EMBED_DEVICE", "cpu") or "cpu"),
+        )
         if _GEOMETRY_CFG_OVERRIDES:
             valid_keys = set(getattr(GeometryConfig, "__dataclass_fields__", {}).keys())
             safe_overrides = {}
@@ -110,10 +132,167 @@ def get_gc():
                     safe_overrides[k] = v
                 else:
                     print(f"[geometry-mcp] Ignoring unknown geometry_config key: {k}", file=sys.stderr)
-            _gc = GeometryController(GEO_DB, cfg=GeometryConfig(**safe_overrides))
+            _gc = GeometryController(
+                GEO_DB,
+                cfg=GeometryConfig(**safe_overrides),
+                embedding_provider=provider,
+            )
         else:
-            _gc = GeometryController(GEO_DB)
+            _gc = GeometryController(GEO_DB, embedding_provider=provider)
     return _gc
+
+
+def _poll_normalized_conversation_id():
+    cid = POLLING_CONVERSATION_ID
+    if cid is None or cid == "":
+        return None
+    try:
+        return int(cid)
+    except Exception:
+        return None
+
+
+def _load_poll_cursor() -> int:
+    try:
+        if not os.path.isfile(POLLING_CURSOR_PATH):
+            return 0
+        with open(POLLING_CURSOR_PATH, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return max(0, int(obj.get("last_rowid", 0)))
+    except Exception:
+        return 0
+
+
+def _save_poll_cursor(rowid: int) -> None:
+    try:
+        os.makedirs(os.path.dirname(POLLING_CURSOR_PATH) or ".", exist_ok=True)
+        tmp = f"{POLLING_CURSOR_PATH}.tmp"
+        payload = {
+            "last_rowid": max(0, int(rowid)),
+            "updated_at": time.time(),
+        }
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, POLLING_CURSOR_PATH)
+    except Exception as exc:
+        if POLLING_DEBUG_LOG:
+            print(f"[geometry-mcp] Failed to save poll cursor: {exc}", file=sys.stderr)
+
+
+def _lcm_max_rowid() -> int:
+    conn = sqlite3.connect(LCM_DB)
+    try:
+        row = conn.execute("SELECT MAX(rowid) AS m FROM messages").fetchone()
+        if row is None:
+            return 0
+        val = row[0]
+        return max(0, int(val or 0))
+    finally:
+        conn.close()
+
+
+def _with_poll_lag(status: dict, cursor_rowid: int | None = None) -> dict:
+    out = dict(status or {})
+    try:
+        max_rowid = _lcm_max_rowid()
+        if cursor_rowid is None:
+            cursor_rowid = int(out.get("next_rowid", out.get("since_rowid", _load_poll_cursor())) or 0)
+        cursor_rowid = max(0, int(cursor_rowid))
+        out["cursor_rowid"] = cursor_rowid
+        out["lcm_max_rowid"] = max_rowid
+        out["lag_rows"] = max(0, int(max_rowid - cursor_rowid))
+    except Exception as exc:
+        if POLLING_DEBUG_LOG:
+            print(f"[geometry-mcp] Failed to compute poll lag: {exc}", file=sys.stderr)
+    return out
+
+
+def _poll_lcm_if_due(force: bool = False, limit_override: int | None = None) -> dict:
+    global _last_poll_ts
+    if not POLLING_ENABLED:
+        return _with_poll_lag({"enabled": False, "skipped": "disabled"})
+
+    now = time.time()
+    with _poll_lock:
+        elapsed = now - float(_last_poll_ts or 0.0)
+        min_interval = max(0.0, float(POLLING_INTERVAL_SEC))
+        if not force and min_interval > 0.0 and elapsed < min_interval:
+            return _with_poll_lag({
+                "enabled": True,
+                "skipped": "cooldown",
+                "next_in_seconds": round(max(0.0, min_interval - elapsed), 3),
+            })
+
+        gc = get_gc()
+        since_rowid = _load_poll_cursor()
+        safe_limit = max(1, int(limit_override if limit_override is not None else POLLING_LIMIT))
+        conv_id = _poll_normalized_conversation_id()
+        try:
+            out = gc.poll_lcm_for_new_items(
+                lcm_db_path=LCM_DB,
+                since_rowid=since_rowid,
+                limit=safe_limit,
+                conversation_id=conv_id,
+            )
+            next_rowid = int(out.get("next_rowid", since_rowid) or since_rowid)
+            if next_rowid > since_rowid:
+                _save_poll_cursor(next_rowid)
+            _last_poll_ts = now
+            out["enabled"] = True
+            out["cursor_path"] = POLLING_CURSOR_PATH
+            out["conversation_id"] = conv_id
+            return _with_poll_lag(out, cursor_rowid=next_rowid)
+        except Exception as exc:
+            _last_poll_ts = now
+            return _with_poll_lag({
+                "enabled": True,
+                "error": str(exc),
+                "since_rowid": since_rowid,
+                "cursor_path": POLLING_CURSOR_PATH,
+            }, cursor_rowid=since_rowid)
+
+
+def _poll_status_line(status: dict | None) -> str:
+    if not isinstance(status, dict):
+        return ""
+    if not POLLING_SHOW_STATUS:
+        return ""
+    if status.get("skipped") == "disabled":
+        return ""
+    if status.get("error"):
+        lag = f" lag_rows={int(status.get('lag_rows', 0) or 0)}" if "lag_rows" in status else ""
+        return f" Live ingest: error={status['error']}{lag}"
+    if status.get("skipped"):
+        if status.get("skipped") == "cooldown":
+            lag = f" lag_rows={int(status.get('lag_rows', 0) or 0)}" if "lag_rows" in status else ""
+            return f" Live ingest: skipped=cooldown next_in={status.get('next_in_seconds', 0)}s{lag}"
+        lag = f" lag_rows={int(status.get('lag_rows', 0) or 0)}" if "lag_rows" in status else ""
+        return f" Live ingest: skipped={status.get('skipped')}{lag}"
+    skipped_dup = int(status.get("skipped_duplicates", 0) or 0)
+    lag = int(status.get("lag_rows", 0) or 0)
+    return (
+        " Live ingest: "
+        f"polled={int(status.get('polled', 0) or 0)} "
+        f"processed={int(status.get('processed', 0) or 0)} "
+        f"failed={int(status.get('failed', 0) or 0)} "
+        f"skipped_dup={skipped_dup} "
+        f"next_rowid={int(status.get('next_rowid', 0) or 0)} "
+        f"lag_rows={lag}"
+    )
+
+
+def _embed_query(query: str) -> list[float]:
+    gc = get_gc()
+    provider = getattr(gc, "embedding_provider", None)
+    if provider is not None:
+        try:
+            return list(provider.embed(query))
+        except Exception as exc:
+            if POLLING_DEBUG_LOG:
+                print(f"[geometry-mcp] Provider query embed fallback due to: {exc}", file=sys.stderr)
+    model = get_model()
+    return model.encode([query], normalize_embeddings=True)[0].tolist()
 
 
 def _get_daily_log_content(gdb_conn, branch_id, max_entries, max_chars):
@@ -143,15 +322,14 @@ def _get_daily_log_content(gdb_conn, branch_id, max_entries, max_chars):
     ]
 
 #  Hybrid search 
-def do_hybrid_search(query, top_n=5):
-    model = get_model()
+def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
     gc = get_gc()
 
     # Encode query
-    q_emb = model.encode([query], normalize_embeddings=True)[0].tolist()
+    q_emb = _embed_query(query)
 
     # Geometry ranking
-    ranked = gc.rank_retrieval(q_emb)
+    ranked = gc.rank_retrieval(q_emb, retrieval_mode=retrieval_mode)
     geo_results = []
     for r in ranked[:top_n]:
         b = gc.db.load_branch(r.branch_id)
@@ -298,6 +476,7 @@ def do_hybrid_search(query, top_n=5):
 
     return {
         'query': query,
+        'retrieval_mode': retrieval_mode,
         'recommendation': recommendation,
         'geometry': {'results': geo_results},
         'lcm': {'conversations': lcm_results, 'keywords': keywords},
@@ -531,7 +710,12 @@ async def list_tools():
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query  question, topic, or keyword phrase"},
-                    "top_n": {"type": "integer", "description": "Results per system (default 5)"}
+                    "top_n": {"type": "integer", "description": "Results per system (default 5)"},
+                    "retrieval_mode": {
+                        "type": "string",
+                        "enum": ["balanced", "factual", "exploratory"],
+                        "description": "Geometry ranking mode. factual=more reliability filtering, exploratory=more novelty tolerance."
+                    }
                 },
                 "required": ["query"]
             }
@@ -551,6 +735,22 @@ async def list_tools():
             name="geometry_stats",
             description="Get overall geometry database statistics  branch count, state distribution, average metrics.",
             inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="sync_lcm_ingest",
+            description=(
+                "Force an immediate incremental poll of new LCM messages into geometry DB. "
+                "Uses persistent rowid cursor and returns ingest status."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional max messages to ingest in this forced poll (default runtime polling.limit)."
+                    }
+                }
+            }
         ),
         Tool(
             name="conversation_content",
@@ -594,12 +794,27 @@ async def list_tools():
 @server.call_tool()
 async def call_tool(name, arguments):
     try:
+        auto_poll_status = None
+        if name != "sync_lcm_ingest":
+            auto_poll_status = _poll_lcm_if_due(force=False)
+        poll_line = _poll_status_line(auto_poll_status)
+
         if name == "hybrid_search":
             query = arguments.get("query", "")
             top_n = arguments.get("top_n", 5)
-            result = do_hybrid_search(query, top_n)
+            retrieval_mode = str(arguments.get("retrieval_mode", "balanced") or "balanced").strip().lower()
+            if retrieval_mode not in ("balanced", "factual", "exploratory"):
+                retrieval_mode = "balanced"
+            result = do_hybrid_search(query, top_n, retrieval_mode=retrieval_mode)
 
-            lines = [f" Hybrid Search: \"{query}\"", f" Recommendation: use {result['recommendation'].upper()}", ""]
+            lines = [
+                f" Hybrid Search: \"{query}\"",
+                f" Retrieval mode: {result.get('retrieval_mode', 'balanced')}",
+                f" Recommendation: use {result['recommendation'].upper()}",
+                "",
+            ]
+            if poll_line:
+                lines.insert(1, poll_line)
             lines.append(" GEOMETRY DB (semantic similarity):")
             for i, r in enumerate(result['geometry']['results'], 1):
                 lines.append(f"  {i}. {r['branch_id']} | sem={r['sem_score']} | trust={r['trust_score']} | nodes={r['nodes']} | eff_rank={r['eff_rank']} | {r['state']}/{r['regime']}")
@@ -630,6 +845,8 @@ async def call_tool(name, arguments):
             if 'error' in rpt:
                 return [TextContent(type="text", text=f"Error: {rpt['error']}")]
             lines = [f" Branch Report: {rpt['branch_id']}"]
+            if poll_line:
+                lines.append(poll_line)
             for k, v in rpt.items():
                 if k != 'branch_id':
                     lines.append(f"  {k}: {v}")
@@ -645,6 +862,34 @@ async def call_tool(name, arguments):
                      f"  Avg eff_rank: {stats['avg_eff_rank']}",
                      f"  Avg coherence: {stats['avg_coherence']}",
                      f"  Embedding: {stats['embedding_model']} ({stats['embedding_dim']}d)"]
+            if poll_line:
+                lines.insert(1, poll_line)
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        elif name == "sync_lcm_ingest":
+            limit_raw = arguments.get("limit")
+            limit = None
+            if limit_raw is not None:
+                try:
+                    limit = max(1, int(limit_raw))
+                except Exception:
+                    limit = None
+            status = _poll_lcm_if_due(force=True, limit_override=limit)
+            lines = [" LCM Ingest Sync"]
+            lines.append(_poll_status_line(status) or " Live ingest: no status")
+            lines.append(f"  Cursor path: {status.get('cursor_path', POLLING_CURSOR_PATH)}")
+            if "since_rowid" in status:
+                lines.append(f"  Since rowid: {status.get('since_rowid')}")
+            if "next_rowid" in status:
+                lines.append(f"  Next rowid: {status.get('next_rowid')}")
+            if "has_more" in status:
+                lines.append(f"  Has more: {status.get('has_more')}")
+            if "lcm_max_rowid" in status:
+                lines.append(f"  LCM max rowid: {status.get('lcm_max_rowid')}")
+            if "lag_rows" in status:
+                lines.append(f"  Lag rows: {status.get('lag_rows')}")
+            if "skipped_duplicates" in status:
+                lines.append(f"  Skipped duplicates: {status.get('skipped_duplicates')}")
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "conversation_content":
@@ -668,6 +913,8 @@ async def call_tool(name, arguments):
                 f"  Total entries: {result['total_entries']}",
                 ""
             ]
+            if poll_line:
+                lines.insert(1, poll_line)
 
             for r in result['results']:
                 lines.append(f"--- {r['branch_id']} | {r['state']}/{r['regime']} | {r['entries_returned']} entries ---")

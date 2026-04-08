@@ -78,6 +78,7 @@ class EdgeType(str, Enum):
     SEMANTIC_NEIGHBOR = "semantic_neighbor"
     CONTRADICTS      = "contradicts"
     REFINES          = "refines"
+    SUPERSEDES       = "supersedes"
     SAME_TOPIC       = "same_topic"
     SAME_TASK        = "same_task"
     SAME_USER_FACT   = "same_user_fact"
@@ -109,6 +110,8 @@ class GeometryConfig:
 
     # ── Allocation thresholds ───────────────────────────────────────────────
     attach_threshold: float = 0.50
+    attach_threshold_by_type: dict = field(default_factory=lambda: {"default": 0.50})
+    tension_threshold_by_type: dict = field(default_factory=lambda: {"default": 0.70})
 
     # ── Retrieval ranker ───────────────────────────────────────────────────
     alpha_sem:   float = 0.60
@@ -123,6 +126,22 @@ class GeometryConfig:
     retrieval_result_limit: int = 128
     candidate_branch_cap: int = 10
     candidate_prefilter_limit: int = 128
+    retrieval_mode_default: str = "balanced"
+    retrieval_mode_factors: dict = field(default_factory=lambda: {
+        "balanced": {
+            "regime": {"PRODUCTIVE": 1.05, "RIGID": 0.95, "UNSTABLE": 0.85},
+            "state": {"REACTIVATING": 1.03, "DORMANT": 0.92, "TENSIONED": 0.90, "FORMING": 0.90},
+        },
+        "factual": {
+            "regime": {"PRODUCTIVE": 1.10, "RIGID": 0.90, "UNSTABLE": 0.60},
+            "state": {"STABLE": 1.05, "ACTIVE": 1.00, "REACTIVATING": 0.95, "DORMANT": 0.85, "TENSIONED": 0.75, "FORMING": 0.80},
+        },
+        "exploratory": {
+            "regime": {"PRODUCTIVE": 1.00, "RIGID": 0.92, "UNSTABLE": 0.95},
+            "state": {"REACTIVATING": 1.08, "ACTIVE": 1.02, "DORMANT": 0.96, "TENSIONED": 0.95, "STABLE": 0.98},
+        },
+    })
+    branch_type_profiles: dict = field(default_factory=dict)
 
     # ── Split scorer ───────────────────────────────────────────────────────
     split_hysteresis: int = 3
@@ -189,6 +208,38 @@ class GeometryConfig:
     dormant_usefulness_max: float = 0.20
     dormant_min_nodes: int = 8
 
+    # ── Protected memory policy (hard gates) ───────────────────────────────
+    protected_branch_types: list[str] = field(default_factory=lambda: [
+        "identity",
+        "user_fact",
+        "user_preference",
+        "preference",
+        "daily_log",
+    ])
+    protected_attach_conflict_threshold: float = 0.35
+    protected_attach_contradiction_threshold: float = 0.20
+    protected_merge_block: bool = True
+    protected_merge_contradiction_threshold: float = 0.20
+
+    # ── Safe reactivation policy ────────────────────────────────────────────
+    reactivation_min_score: float = 0.60
+    reactivation_guard_enabled: bool = True
+    reactivation_max_contradiction: float = 0.35
+    reactivation_max_retrieval_error: float = 0.60
+    reactivation_min_similarity: float = 0.15
+
+    # ── Update-mode classification (metadata) ──────────────────────────────
+    update_mode_refine_similarity_min: float = 0.92
+    update_mode_contradict_conflict_min: float = 0.25
+    update_mode_supersede_similarity_min: float = 0.78
+    update_mode_supersede_conflict_min: float = 0.70
+    update_mode_supersede_branch_types: list[str] = field(default_factory=lambda: [
+        "identity",
+        "user_fact",
+        "user_preference",
+        "preference",
+    ])
+
     # ── Initial state ──────────────────────────────────────────────────────
     initial_state: BranchState = BranchState.FORMING
 
@@ -252,6 +303,11 @@ class MemoryNode:
     compression_loss:    float = 0.0
     reactivation_score:  float = 0.0
     stability_state:     str   = BranchState.ACTIVE
+    update_mode:         str   = "attach"
+    correction_kind:     str   = "none"
+    correction_prev_id:  Optional[str] = None
+    correction_root_id:  Optional[str] = None
+    correction_version:  int   = 1
 
 
 @dataclass
@@ -261,6 +317,7 @@ class AllocationDecision:
     csd_score:      float
     conflict_score: float
     rationale:      str
+    update_mode:    str = "attach"
 
 
 @dataclass
@@ -270,6 +327,71 @@ class RetrievalCandidate:
     trust_score: float
     react_score: float
     total_score: float
+
+
+def _branch_type_profile(cfg: GeometryConfig, branch_type: str) -> dict[str, Any]:
+    raw = getattr(cfg, "branch_type_profiles", None)
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    bt = str(branch_type or "").strip().lower()
+    if bt and bt in raw and isinstance(raw.get(bt), dict):
+        return dict(raw[bt])
+    for k, v in raw.items():
+        if str(k).strip().lower() == bt and isinstance(v, dict):
+            return dict(v)
+    default = raw.get("default")
+    if isinstance(default, dict):
+        return dict(default)
+    for k, v in raw.items():
+        if str(k).strip().lower() == "default" and isinstance(v, dict):
+            return dict(v)
+    return {}
+
+
+def _profile_weight(
+    profile: dict[str, Any],
+    group: str,
+    key: str,
+    fallback: float,
+    aliases: Optional[list[str]] = None,
+) -> float:
+    names = [str(key)]
+    if aliases:
+        names.extend(str(x) for x in aliases)
+
+    g = profile.get(group)
+    if isinstance(g, dict):
+        for n in names:
+            if n in g:
+                try:
+                    return float(g[n])
+                except Exception:
+                    pass
+        for k, v in g.items():
+            sk = str(k).strip().lower()
+            for n in names:
+                if sk == str(n).strip().lower():
+                    try:
+                        return float(v)
+                    except Exception:
+                        pass
+
+    for n in names:
+        if n in profile:
+            try:
+                return float(profile[n])
+            except Exception:
+                pass
+    for k, v in profile.items():
+        sk = str(k).strip().lower()
+        for n in names:
+            if sk == str(n).strip().lower():
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+
+    return float(fallback)
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +416,11 @@ CREATE TABLE IF NOT EXISTS memory_nodes (
     compression_loss    REAL DEFAULT 0.0,
     reactivation_score  REAL DEFAULT 0.0,
     stability_state     TEXT DEFAULT 'ACTIVE',
+    update_mode         TEXT DEFAULT 'attach',
+    correction_kind     TEXT DEFAULT 'none',
+    correction_prev_id  TEXT,
+    correction_root_id  TEXT,
+    correction_version  INTEGER DEFAULT 1,
     FOREIGN KEY(parent_id) REFERENCES memory_nodes(id)
 );
 
@@ -323,6 +450,7 @@ CREATE TABLE IF NOT EXISTS branch_states (
     contradiction_density REAL DEFAULT 0.0,
     retrieval_error      REAL DEFAULT 0.0,
     usefulness           REAL DEFAULT 0.0,
+    reactivation_score   REAL DEFAULT 0.0,
     split_counter        INTEGER DEFAULT 0,
     merge_counter        INTEGER DEFAULT 0,
     last_update_ts       REAL
@@ -662,13 +790,26 @@ class CSDScorer:
         sem_dist  = 1.0 - GeometryMath.cosine_sim(item_emb, mu_B)
 
         c = self.cfg
+        p = _branch_type_profile(c, stats.branch_type)
+        w_gamma_mu = _profile_weight(p, "csd_gamma", "mu", c.gamma_mu, aliases=["gamma_mu"])
+        w_gamma_r = _profile_weight(p, "csd_gamma", "r", c.gamma_r, aliases=["gamma_r"])
+        w_gamma_A = _profile_weight(p, "csd_gamma", "A", c.gamma_A, aliases=["a", "anisotropy", "gamma_A"])
+        w_gamma_tau = _profile_weight(p, "csd_gamma", "tau", c.gamma_tau, aliases=["trace", "gamma_tau"])
+        w_gamma_sem = _profile_weight(p, "csd_gamma", "sem", c.gamma_sem, aliases=["semantic", "gamma_sem"])
+        w_gamma_conflict = _profile_weight(
+            p,
+            "csd_gamma",
+            "conflict",
+            c.gamma_conflict,
+            aliases=["gamma_conflict"],
+        )
         csd = (
-            c.gamma_mu       * R_mu
-            + c.gamma_r      * R_r
-            + c.gamma_A      * R_A
-            + c.gamma_tau    * R_tau
-            + c.gamma_sem    * sem_dist
-            + c.gamma_conflict * conflict
+            w_gamma_mu       * R_mu
+            + w_gamma_r      * R_r
+            + w_gamma_A      * R_A
+            + w_gamma_tau    * R_tau
+            + w_gamma_sem    * sem_dist
+            + w_gamma_conflict * conflict
         )
 
         # Update EMA baselines
@@ -684,12 +825,36 @@ class CSDScorer:
         self,
         csd_score: float,
         cfg: Optional[GeometryConfig] = None,
+        branch_type: Optional[str] = None,
     ) -> str:
         """'attach' | 'attach_tension' | 'fork'"""
         c = cfg or self.cfg
-        if csd_score < c.attach_threshold:
+        bt = str(branch_type or "").strip().lower()
+
+        def _resolve(mapping: Any, fallback: float) -> float:
+            try:
+                if isinstance(mapping, dict) and mapping:
+                    if bt and bt in mapping:
+                        return float(mapping[bt])
+                    for k, v in mapping.items():
+                        if str(k).lower() == bt:
+                            return float(v)
+                    if "default" in mapping:
+                        return float(mapping["default"])
+                    for k, v in mapping.items():
+                        if str(k).lower() == "default":
+                            return float(v)
+            except Exception:
+                pass
+            return float(fallback)
+
+        attach_th = _resolve(getattr(c, "attach_threshold_by_type", None), c.attach_threshold)
+        tension_th = _resolve(getattr(c, "tension_threshold_by_type", None), c.tension_threshold)
+        tension_th = max(float(tension_th), float(attach_th))
+
+        if csd_score < attach_th:
             return "attach"
-        if csd_score < c.tension_threshold:
+        if csd_score < tension_th:
             return "attach_tension"
         return "fork"
 
@@ -714,21 +879,46 @@ class MergeScorer:
         mu1 = np.array(s1.mean_vec, dtype=np.float32)
         mu2 = np.array(s2.mean_vec, dtype=np.float32)
         c   = self.cfg
+        p1 = _branch_type_profile(c, s1.branch_type)
+        p2 = _branch_type_profile(c, s2.branch_type)
+
+        def _avg(group: str, key: str, fallback: float, aliases: Optional[list[str]] = None) -> float:
+            w1 = _profile_weight(p1, group, key, fallback, aliases=aliases)
+            w2 = _profile_weight(p2, group, key, fallback, aliases=aliases)
+            return 0.5 * (float(w1) + float(w2))
+
+        w_eta_cos = _avg("merge_eta", "cos", c.eta_cos, aliases=["eta_cos"])
+        w_eta_topic = _avg("merge_eta", "topic", c.eta_topic, aliases=["eta_topic"])
+        w_eta_co_use = _avg("merge_eta", "co_use", c.eta_co_use, aliases=["co_use", "eta_co_use"])
+        w_eta_contradiction = _avg(
+            "merge_eta",
+            "contradiction",
+            c.eta_contradiction,
+            aliases=["eta_contradiction"],
+        )
+        w_eta_drift = _avg("merge_eta", "drift", c.eta_drift, aliases=["eta_drift"])
+
         cos = GeometryMath.cosine_sim(mu1, mu2)
         drift_mismatch = abs(s1.anchor_drift - s2.anchor_drift)
         score = (
-            c.eta_cos          * cos
-            + c.eta_topic      * topic_overlap
-            + c.eta_co_use     * retrieval_co_use
-            + c.eta_contradiction * ((s1.contradiction_density + s2.contradiction_density) / 2)
-            + c.eta_drift      * drift_mismatch
+            w_eta_cos          * cos
+            + w_eta_topic      * topic_overlap
+            + w_eta_co_use     * retrieval_co_use
+            + w_eta_contradiction * ((s1.contradiction_density + s2.contradiction_density) / 2)
+            + w_eta_drift      * drift_mismatch
         )
         return float(score)
 
     def should_merge(self, s1: BranchStats, s2: BranchStats, score: float) -> bool:
+        c = self.cfg
+        p1 = _branch_type_profile(c, s1.branch_type)
+        p2 = _branch_type_profile(c, s2.branch_type)
+        th1 = _profile_weight(p1, "merge_policy", "threshold", 0.55, aliases=["merge_threshold"])
+        th2 = _profile_weight(p2, "merge_policy", "threshold", 0.55, aliases=["merge_threshold"])
+        merge_threshold = 0.5 * (float(th1) + float(th2))
         states_ok = s1.state in (BranchState.STABLE, BranchState.DORMANT)
         states_ok = states_ok and s2.state in (BranchState.STABLE, BranchState.DORMANT)
-        return states_ok and score > 0.55
+        return states_ok and score > merge_threshold
 
 
 class SplitScorer:
@@ -737,18 +927,70 @@ class SplitScorer:
 
     def score(self, s: BranchStats) -> float:
         c = self.cfg
+        p = _branch_type_profile(c, s.branch_type)
+        w_incoh = _profile_weight(
+            p,
+            "split_zeta",
+            "incoherence",
+            c.zeta_incoherence,
+            aliases=["zeta_incoherence"],
+        )
+        w_aniso = _profile_weight(
+            p,
+            "split_zeta",
+            "anisotropy",
+            c.zeta_anisotropy,
+            aliases=["zeta_anisotropy"],
+        )
+        w_comp = _profile_weight(
+            p,
+            "split_zeta",
+            "comp_loss",
+            c.zeta_comp_loss,
+            aliases=["compression_loss", "zeta_comp_loss"],
+        )
+        w_ret = _profile_weight(
+            p,
+            "split_zeta",
+            "ret_error",
+            c.zeta_ret_error,
+            aliases=["retrieval_error", "zeta_ret_error"],
+        )
+        w_contra = _profile_weight(
+            p,
+            "split_zeta",
+            "contradiction",
+            c.zeta_contradiction,
+            aliases=["zeta_contradiction"],
+        )
         return float(
-            c.zeta_incoherence   * (1.0 - s.coherence)
-            + c.zeta_anisotropy  * s.anisotropy
-            + c.zeta_comp_loss   * s.compression_loss
-            + c.zeta_ret_error   * s.retrieval_error
-            + c.zeta_contradiction * s.contradiction_density
+            w_incoh   * (1.0 - s.coherence)
+            + w_aniso  * s.anisotropy
+            + w_comp   * s.compression_loss
+            + w_ret   * s.retrieval_error
+            + w_contra * s.contradiction_density
         )
 
     def should_split(self, s: BranchStats, score: float, cfg: GeometryConfig) -> bool:
+        p = _branch_type_profile(cfg, s.branch_type)
+        split_threshold = _profile_weight(
+            p,
+            "split_policy",
+            "threshold",
+            cfg.split_score_threshold,
+            aliases=["split_threshold", "split_score_threshold"],
+        )
+        split_hysteresis = int(round(_profile_weight(
+            p,
+            "split_policy",
+            "hysteresis",
+            float(cfg.split_hysteresis),
+            aliases=["split_hysteresis"],
+        )))
+        split_hysteresis = max(1, split_hysteresis)
         return (
-            score > cfg.split_score_threshold
-            and s.split_counter >= cfg.split_hysteresis
+            score > split_threshold
+            and s.split_counter >= split_hysteresis
         )
 
 
@@ -760,36 +1002,100 @@ class RetrievalRanker:
     def __init__(self, cfg: GeometryConfig):
         self.cfg = cfg
 
+    def _get_mode_profile(self, mode: str) -> dict[str, Any]:
+        raw = getattr(self.cfg, "retrieval_mode_factors", None)
+        if not isinstance(raw, dict):
+            raw = {}
+        m = str(mode or "").strip().lower()
+        profile = raw.get(m)
+        if not isinstance(profile, dict):
+            profile = raw.get("balanced", {})
+            if not isinstance(profile, dict):
+                profile = {}
+        return profile
+
+    def _mode_multiplier(self, mode: str, s: BranchStats) -> float:
+        profile = self._get_mode_profile(mode)
+        regime_map = profile.get("regime") if isinstance(profile.get("regime"), dict) else {}
+        state_map = profile.get("state") if isinstance(profile.get("state"), dict) else {}
+        r_key = s.regime.value if isinstance(s.regime, GeometricRegime) else str(s.regime or "")
+        s_key = s.state.value if isinstance(s.state, BranchState) else str(s.state or "")
+        r_mul = float(regime_map.get(str(r_key), 1.0))
+        s_mul = float(state_map.get(str(s_key), 1.0))
+        return max(0.25, min(1.50, r_mul * s_mul))
+
     def rank(
         self,
         query_emb: np.ndarray,
         candidates: list[BranchStats],
         historical_use: Optional[dict[str, float]] = None,
         same_project: Optional[dict[str, float]] = None,
+        retrieval_mode: Optional[str] = None,
     ) -> list[RetrievalCandidate]:
         results = []
         c = self.cfg
+        mode = str(
+            retrieval_mode
+            or getattr(c, "retrieval_mode_default", "balanced")
+            or "balanced"
+        ).strip().lower()
         for s in candidates:
             if not s.mean_vec:
                 continue
             mu = np.array(s.mean_vec, dtype=np.float32)
+            p = _branch_type_profile(c, s.branch_type)
+            w_kappa_coh = _profile_weight(
+                p,
+                "retrieval_kappa",
+                "coherence",
+                c.kappa_coherence,
+                aliases=["kappa_coherence"],
+            )
+            w_kappa_comp = _profile_weight(
+                p,
+                "retrieval_kappa",
+                "comp_loss",
+                c.kappa_comp_loss,
+                aliases=["compression_loss", "kappa_comp_loss"],
+            )
+            w_kappa_contra = _profile_weight(
+                p,
+                "retrieval_kappa",
+                "contradiction",
+                c.kappa_contradiction,
+                aliases=["kappa_contradiction"],
+            )
+            w_kappa_ret = _profile_weight(
+                p,
+                "retrieval_kappa",
+                "ret_error",
+                c.kappa_ret_error,
+                aliases=["retrieval_error", "kappa_ret_error"],
+            )
+            w_kappa_hist = _profile_weight(
+                p,
+                "retrieval_kappa",
+                "hist",
+                c.kappa_hist,
+                aliases=["kappa_hist"],
+            )
 
             sem   = GeometryMath.cosine_sim(query_emb, mu)
             trust = (
-                c.kappa_coherence     * s.coherence
-                + c.kappa_comp_loss   * s.compression_loss
-                + c.kappa_contradiction * s.contradiction_density
-                + c.kappa_ret_error   * s.retrieval_error
+                w_kappa_coh     * s.coherence
+                + w_kappa_comp   * s.compression_loss
+                + w_kappa_contra * s.contradiction_density
+                + w_kappa_ret   * s.retrieval_error
             )
             hist  = (historical_use or {}).get(s.branch_id, 0.0)
             proj  = (same_project  or {}).get(s.branch_id, 0.0)
             react = (
                 0.5 * sem
-                + c.kappa_hist * hist
+                + w_kappa_hist * hist
                 + 0.3 * proj
             )
-
-            total = c.alpha_sem * sem + c.beta_trust * trust + c.delta_react * react
+            total_raw = c.alpha_sem * sem + c.beta_trust * trust + c.delta_react * react
+            total = total_raw * self._mode_multiplier(mode, s)
 
             results.append(RetrievalCandidate(
                 branch_id=s.branch_id,
@@ -887,8 +1193,43 @@ class GeometryDB:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA_SQL)
+            self._ensure_schema_migrations()
             self._conn.commit()
         return self._conn
+
+    def _ensure_schema_migrations(self) -> None:
+        branch_cols = {
+            str(r["name"])
+            for r in self._conn.execute("PRAGMA table_info(branch_states)").fetchall()
+        }
+        if "reactivation_score" not in branch_cols:
+            self._conn.execute(
+                "ALTER TABLE branch_states ADD COLUMN reactivation_score REAL DEFAULT 0.0"
+            )
+        node_cols = {
+            str(r["name"])
+            for r in self._conn.execute("PRAGMA table_info(memory_nodes)").fetchall()
+        }
+        if "update_mode" not in node_cols:
+            self._conn.execute(
+                "ALTER TABLE memory_nodes ADD COLUMN update_mode TEXT DEFAULT 'attach'"
+            )
+        if "correction_kind" not in node_cols:
+            self._conn.execute(
+                "ALTER TABLE memory_nodes ADD COLUMN correction_kind TEXT DEFAULT 'none'"
+            )
+        if "correction_prev_id" not in node_cols:
+            self._conn.execute(
+                "ALTER TABLE memory_nodes ADD COLUMN correction_prev_id TEXT"
+            )
+        if "correction_root_id" not in node_cols:
+            self._conn.execute(
+                "ALTER TABLE memory_nodes ADD COLUMN correction_root_id TEXT"
+            )
+        if "correction_version" not in node_cols:
+            self._conn.execute(
+                "ALTER TABLE memory_nodes ADD COLUMN correction_version INTEGER DEFAULT 1"
+            )
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -909,7 +1250,7 @@ class GeometryDB:
                  eff_rank, trace, anisotropy, anchor_drift,
                  coherence, compression_loss,
                  node_count, contradiction_density,
-                 retrieval_error, usefulness,
+                 retrieval_error, usefulness, reactivation_score,
                  split_counter, merge_counter, last_update_ts)
             VALUES
                 (:branch_id, :branch_type, :state, :regime,
@@ -917,9 +1258,59 @@ class GeometryDB:
                  :eff_rank, :trace, :anisotropy, :anchor_drift,
                  :coherence, :compression_loss,
                  :node_count, :contradiction_density,
-                 :retrieval_error, :usefulness,
+                 :retrieval_error, :usefulness, :reactivation_score,
                  :split_counter, :merge_counter, :last_update_ts)
         """, d)
+        self.conn.commit()
+
+    def update_branch_scalars(self, s: BranchStats) -> None:
+        cur = self.conn.execute(
+            """
+            UPDATE branch_states
+            SET
+                branch_type=?,
+                state=?,
+                regime=?,
+                eff_rank=?,
+                trace=?,
+                anisotropy=?,
+                anchor_drift=?,
+                coherence=?,
+                compression_loss=?,
+                node_count=?,
+                contradiction_density=?,
+                retrieval_error=?,
+                usefulness=?,
+                reactivation_score=?,
+                split_counter=?,
+                merge_counter=?,
+                last_update_ts=?
+            WHERE branch_id=?
+            """,
+            (
+                str(s.branch_type),
+                s.state.value if isinstance(s.state, BranchState) else str(s.state),
+                s.regime.value if isinstance(s.regime, GeometricRegime) else str(s.regime),
+                float(s.eff_rank),
+                float(s.trace),
+                float(s.anisotropy),
+                float(s.anchor_drift),
+                float(s.coherence),
+                float(s.compression_loss),
+                int(s.node_count),
+                float(s.contradiction_density),
+                float(s.retrieval_error),
+                float(s.usefulness),
+                float(getattr(s, "reactivation_score", 0.0)),
+                int(s.split_counter),
+                int(s.merge_counter),
+                float(s.last_update_ts),
+                str(s.branch_id),
+            ),
+        )
+        if int(cur.rowcount or 0) <= 0:
+            self.upsert_branch(s)
+            return
         self.conn.commit()
 
     def load_branch(self, branch_id: str) -> Optional[BranchStats]:
@@ -951,7 +1342,8 @@ class GeometryDB:
             "branch_id, branch_type, state, regime, "
             "eff_rank, trace, anisotropy, anchor_drift, "
             "coherence, compression_loss, node_count, contradiction_density, "
-            "retrieval_error, usefulness, split_counter, merge_counter, last_update_ts, "
+            "retrieval_error, usefulness, reactivation_score, "
+            "split_counter, merge_counter, last_update_ts, "
             "CASE WHEN mean_vec IS NOT NULL AND length(mean_vec) > 2 THEN 1 ELSE 0 END AS has_mean "
             "FROM branch_states"
         )
@@ -1043,14 +1435,19 @@ class GeometryDB:
              role, token_count, embedding,
              importance_score, novelty_score, conflict_score,
              coherence_score, compression_loss, reactivation_score,
-             stability_state)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             stability_state, update_mode,
+             correction_kind, correction_prev_id, correction_root_id, correction_version)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             n.node_id, n.lcm_id, n.node_type, n.parent_id, n.branch_id,
             n.timestamp, n.role, n.token_count, emb_blob,
             n.importance_score, n.novelty_score, n.conflict_score,
             n.coherence_score, n.compression_loss, n.reactivation_score,
-            n.stability_state,
+            n.stability_state, str(n.update_mode or "attach"),
+            str(n.correction_kind or "none"),
+            (str(n.correction_prev_id) if n.correction_prev_id else None),
+            (str(n.correction_root_id) if n.correction_root_id else None),
+            int(max(1, int(n.correction_version or 1))),
         ))
         self.conn.commit()
 
@@ -1242,8 +1639,66 @@ class GeometryDB:
             return None
         return str(row["id"])
 
+    def existing_lcm_ids(self, lcm_ids: list[str], node_type: Optional[NodeType] = None) -> set[str]:
+        ids = [str(x) for x in lcm_ids if x is not None and str(x) != ""]
+        if not ids:
+            return set()
+        seen: set[str] = set()
+        chunk_size = 800
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i:i + chunk_size]
+            ph = ",".join(["?"] * len(chunk))
+            if node_type is None:
+                q = f"SELECT DISTINCT lcm_id FROM memory_nodes WHERE lcm_id IN ({ph})"
+                rows = self.conn.execute(q, tuple(chunk)).fetchall()
+            else:
+                node_type_val = str(getattr(node_type, "value", node_type))
+                q = f"SELECT DISTINCT lcm_id FROM memory_nodes WHERE node_type=? AND lcm_id IN ({ph})"
+                rows = self.conn.execute(q, tuple([node_type_val] + chunk)).fetchall()
+            for r in rows:
+                val = r["lcm_id"]
+                if val is not None:
+                    seen.add(str(val))
+        return seen
+
+    def get_node_correction_meta(self, node_id: str) -> dict[str, Any]:
+        row = self.conn.execute(
+            """
+            SELECT id,
+                   update_mode,
+                   correction_kind,
+                   correction_prev_id,
+                   correction_root_id,
+                   correction_version
+            FROM memory_nodes
+            WHERE id=?
+            LIMIT 1
+            """,
+            (node_id,),
+        ).fetchone()
+        if row is None:
+            return {
+                "id": str(node_id),
+                "update_mode": "attach",
+                "correction_kind": "none",
+                "correction_prev_id": None,
+                "correction_root_id": None,
+                "correction_version": 1,
+            }
+        return {
+            "id": str(row["id"]),
+            "update_mode": str(row["update_mode"] or "attach"),
+            "correction_kind": str(row["correction_kind"] or "none"),
+            "correction_prev_id": str(row["correction_prev_id"]) if row["correction_prev_id"] else None,
+            "correction_root_id": str(row["correction_root_id"]) if row["correction_root_id"] else None,
+            "correction_version": int(row["correction_version"] or 1),
+        }
+
     def list_branch_nodes(self, branch_id: str, include_embeddings: bool = False) -> list[dict[str, Any]]:
-        cols = "id, lcm_id, branch_id, timestamp, token_count, role"
+        cols = (
+            "id, lcm_id, branch_id, timestamp, token_count, role, update_mode, "
+            "correction_kind, correction_prev_id, correction_root_id, correction_version"
+        )
         if include_embeddings:
             cols += ", embedding"
         rows = self.conn.execute(
@@ -1258,6 +1713,71 @@ class GeometryDB:
                 row["embedding"] = json.loads(blob.decode()) if blob else []
             out.append(row)
         return out
+
+    def branch_update_mode_counts(self, branch_id: str) -> dict[str, int]:
+        rows = self.conn.execute(
+            """
+            SELECT COALESCE(update_mode, 'attach') AS update_mode, COUNT(*) AS c
+            FROM memory_nodes
+            WHERE branch_id=?
+            GROUP BY COALESCE(update_mode, 'attach')
+            ORDER BY c DESC
+            """,
+            (branch_id,),
+        ).fetchall()
+        return {str(r["update_mode"]): int(r["c"] or 0) for r in rows}
+
+    def branch_correction_counts(self, branch_id: str) -> dict[str, Any]:
+        rows = self.conn.execute(
+            """
+            SELECT COALESCE(correction_kind, 'none') AS correction_kind, COUNT(*) AS c
+            FROM memory_nodes
+            WHERE branch_id=?
+            GROUP BY COALESCE(correction_kind, 'none')
+            ORDER BY c DESC
+            """,
+            (branch_id,),
+        ).fetchall()
+        by_kind = {str(r["correction_kind"]): int(r["c"] or 0) for r in rows}
+        chain_links = int(
+            (
+                self.conn.execute(
+                    "SELECT COUNT(*) AS c FROM memory_nodes WHERE branch_id=? AND correction_prev_id IS NOT NULL",
+                    (branch_id,),
+                ).fetchone()["c"]
+            )
+            or 0
+        )
+        max_version = int(
+            (
+                self.conn.execute(
+                    "SELECT MAX(correction_version) AS v FROM memory_nodes WHERE branch_id=?",
+                    (branch_id,),
+                ).fetchone()["v"]
+            )
+            or 1
+        )
+        return {
+            "by_kind": by_kind,
+            "chain_links": chain_links,
+            "max_version": max_version,
+        }
+
+    def recent_corrections(self, branch_id: str, limit: int = 8) -> list[dict[str, Any]]:
+        lim = max(1, int(limit))
+        rows = self.conn.execute(
+            """
+            SELECT id, lcm_id, timestamp, update_mode,
+                   correction_kind, correction_prev_id, correction_root_id, correction_version
+            FROM memory_nodes
+            WHERE branch_id=?
+              AND correction_prev_id IS NOT NULL
+            ORDER BY timestamp DESC, rowid DESC
+            LIMIT ?
+            """,
+            (branch_id, lim),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def reassign_nodes_to_branch(self, node_ids: list[str], branch_id: str) -> int:
         if not node_ids:
@@ -1576,6 +2096,40 @@ class GeometryController:
         self.regime            = RegimeClassifier(self.cfg)
         self.embedding_provider = embedding_provider  # may be None
         self.db.connect()
+        self._poll_lock        = threading.Lock()
+
+    def _branch_stats_from_scalar_row(self, row: dict[str, Any]) -> BranchStats:
+        try:
+            state = BranchState(str(row.get("state") or BranchState.FORMING.value))
+        except Exception:
+            state = BranchState.FORMING
+        try:
+            regime = GeometricRegime(str(row.get("regime") or GeometricRegime.PRODUCTIVE.value))
+        except Exception:
+            regime = GeometricRegime.PRODUCTIVE
+        return BranchStats(
+            branch_id=str(row.get("branch_id") or ""),
+            branch_type=str(row.get("branch_type") or "default"),
+            state=state,
+            regime=regime,
+            mean_vec=[],
+            anchor=[],
+            cov_diagonal=[],
+            eff_rank=float(row.get("eff_rank") or 0.0),
+            trace=float(row.get("trace") or 0.0),
+            anisotropy=float(row.get("anisotropy") or 0.0),
+            anchor_drift=float(row.get("anchor_drift") or 0.0),
+            coherence=float(row.get("coherence") or 0.0),
+            compression_loss=float(row.get("compression_loss") or 0.0),
+            node_count=int(row.get("node_count") or 0),
+            contradiction_density=float(row.get("contradiction_density") or 0.0),
+            retrieval_error=float(row.get("retrieval_error") or 0.0),
+            usefulness=float(row.get("usefulness") or 0.0),
+            reactivation_score=float(row.get("reactivation_score") or 0.0),
+            split_counter=int(row.get("split_counter") or 0),
+            merge_counter=int(row.get("merge_counter") or 0),
+            last_update_ts=float(row.get("last_update_ts") or 0.0),
+        )
 
     # ------------------------------------------------------------------
     # 1. On-new-item pipeline (call after LCM persists to immutable store)
@@ -1624,11 +2178,14 @@ class GeometryController:
             emb = np.zeros(self.cfg.embedding_dim, dtype=np.float32)
 
         forced_branch = bool(force_branch_id)
+        policy_note = ""
+        best_branch_ref: Optional[BranchStats] = None
         if forced_branch:
             best_branch = self._ensure_branch(str(force_branch_id), node_type)
             best_csd = 0.0
             action = "attach"
             branch_id = best_branch.branch_id
+            best_branch_ref = best_branch
         else:
             candidates = self._get_candidate_branches(active_branch_id)
 
@@ -1646,8 +2203,15 @@ class GeometryController:
                 action    = "fork"
                 branch_id = self._create_branch(node_type)
             else:
-                action    = self.csd.decide(best_csd, self.cfg)
+                action    = self.csd.decide(best_csd, self.cfg, branch_type=best_branch.branch_type)
                 branch_id = best_branch.branch_id
+                best_branch_ref = best_branch
+
+                if action in ("attach", "attach_tension"):
+                    force_fork, reason = self._protected_attach_requires_fork(best_branch, conflict_score)
+                    if force_fork:
+                        action = "fork"
+                        policy_note = f"; protected_gate={reason}"
 
                 if action == "fork":
                     branch_id = self._create_branch(node_type, near=best_branch.branch_id)
@@ -1656,6 +2220,28 @@ class GeometryController:
         # Persist node
         parent_node_id = self.db.find_node_id_by_lcm_id(parent_lcm_id) if parent_lcm_id else None
         prev_node_id = self.db.get_last_node_id(branch_id)
+        update_mode = self._classify_update_mode(
+            action=action,
+            best_branch=best_branch_ref,
+            item_emb=emb,
+            conflict_score=conflict_score,
+            forced_branch=forced_branch,
+        )
+        correction_kind = "none"
+        correction_prev_id: Optional[str] = None
+        correction_root_id: Optional[str] = None
+        correction_version = 1
+
+        if prev_node_id and update_mode in ("refine", "contradict", "supersede"):
+            prev_meta = self.db.get_node_correction_meta(prev_node_id)
+            correction_kind = str(update_mode)
+            correction_prev_id = prev_node_id
+            correction_root_id = (
+                str(prev_meta.get("correction_root_id"))
+                if prev_meta.get("correction_root_id")
+                else str(prev_node_id)
+            )
+            correction_version = max(1, int(prev_meta.get("correction_version") or 1) + 1)
 
         node = MemoryNode(
             node_id    = str(uuid.uuid4()),
@@ -1668,6 +2254,11 @@ class GeometryController:
             token_count = token_count,
             embedding  = emb.tolist(),
             conflict_score = conflict_score,
+            update_mode = update_mode,
+            correction_kind = correction_kind,
+            correction_prev_id = correction_prev_id,
+            correction_root_id = correction_root_id,
+            correction_version = correction_version,
         )
         self.db.insert_node(node)
 
@@ -1679,6 +2270,15 @@ class GeometryController:
         if parent_node_id and conflict_score > 0.0:
             self.db.add_edge(parent_node_id, node.node_id, EdgeType.CONTRADICTS, weight=float(conflict_score))
 
+        # Explicit versioned correction links (v1): new node points to previous version.
+        if correction_prev_id:
+            if correction_kind == "refine":
+                self.db.add_edge(node.node_id, correction_prev_id, EdgeType.REFINES, weight=1.0)
+            elif correction_kind == "contradict":
+                self.db.add_edge(node.node_id, correction_prev_id, EdgeType.CONTRADICTS, weight=max(0.01, float(conflict_score)))
+            elif correction_kind == "supersede":
+                self.db.add_edge(node.node_id, correction_prev_id, EdgeType.SUPERSEDES, weight=max(0.01, float(conflict_score)))
+
         # Adiabatically update branch geometry
         updated = self.db.load_branch(branch_id)
         if updated:
@@ -1689,12 +2289,12 @@ class GeometryController:
         if forced_branch:
             rationale = (
                 f"forced_branch_lock={branch_id}; "
-                f"conflict={conflict_score:.2f}; branch={branch_id}"
+                f"conflict={conflict_score:.2f}; branch={branch_id}; mode={update_mode}"
             )
         else:
             rationale = (
                 f"CSD={best_csd:.3f} -> {action}; "
-                f"conflict={conflict_score:.2f}; branch={branch_id}"
+                f"conflict={conflict_score:.2f}; branch={branch_id}; mode={update_mode}{policy_note}"
             )
 
         return AllocationDecision(
@@ -1703,6 +2303,7 @@ class GeometryController:
             csd_score      = best_csd,
             conflict_score = conflict_score,
             rationale      = rationale,
+            update_mode    = update_mode,
         )
 
     # ------------------------------------------------------------------
@@ -1714,6 +2315,7 @@ class GeometryController:
         query_embedding: list[float],
         historical_use:  Optional[dict[str, float]] = None,
         same_project:    Optional[dict[str, float]] = None,
+        retrieval_mode:  Optional[str] = None,
     ) -> list[RetrievalCandidate]:
         """
         Returns branches sorted by retrieval priority.
@@ -1792,7 +2394,13 @@ class GeometryController:
         if not candidates:
             return []
         q_emb = np.array(query_embedding, dtype=np.float32)
-        ranked = self.ranker.rank(q_emb, candidates, historical_use, same_project)
+        ranked = self.ranker.rank(
+            q_emb,
+            candidates,
+            historical_use,
+            same_project,
+            retrieval_mode=retrieval_mode,
+        )
         return ranked[: max(1, int(self.cfg.retrieval_result_limit))]
 
     # ------------------------------------------------------------------
@@ -1891,48 +2499,68 @@ class GeometryController:
         split_enqueue_cap = max(0, int(self.cfg.max_split_enqueues_per_cycle))
         split_candidates: list[dict[str, Any]] = []
         split_observations: list[dict[str, Any]] = []
+        scalar_rows = self.db.list_branch_scalars()
+        all_stats: list[BranchStats] = []
+        has_mean_by_id: dict[str, bool] = {}
+        for row in scalar_rows:
+            bid = str(row.get("branch_id") or "")
+            if not bid:
+                continue
+            has_mean_by_id[bid] = bool(int(row.get("has_mean") or 0))
+            all_stats.append(self._branch_stats_from_scalar_row(row))
+        full_loaded_ids: set[str] = set()
 
-        all_stats = self.db.all_branches()
+        def _persist_branch(s: BranchStats) -> None:
+            if s.branch_id in full_loaded_ids:
+                self.db.upsert_branch(s)
+            else:
+                self.db.update_branch_scalars(s)
 
         cycle_now_ts = time.time()
-        for s in all_stats:
+        for i, s in enumerate(all_stats):
             if s is None:
                 continue
 
             embs, weights = self.db.get_branch_embeddings(s.branch_id)
             if embs.shape[0] >= self.cfg.min_branch_size:
+                full_s = self.db.load_branch(s.branch_id)
+                if full_s is None:
+                    continue
+                full_loaded_ids.add(full_s.branch_id)
                 mu = GeometryMath.weighted_mean(embs, weights)
                 stats_dict = GeometryMath.compute_full_stats(embs, weights, mu)
                 rho = self.cfg.stat_rho
-                s.mean_vec = mu.tolist()
-                s.eff_rank = (1 - rho) * s.eff_rank + rho * stats_dict["eff_rank"]
-                s.trace = (1 - rho) * s.trace + rho * stats_dict["trace"]
-                s.anisotropy = (1 - rho) * s.anisotropy + rho * stats_dict["anisotropy"]
-                s.coherence = (1 - rho) * s.coherence + rho * stats_dict["coherence"]
-                if s.anchor:
-                    a_old = np.array(s.anchor, dtype=np.float32)
+                full_s.mean_vec = mu.tolist()
+                full_s.eff_rank = (1 - rho) * full_s.eff_rank + rho * stats_dict["eff_rank"]
+                full_s.trace = (1 - rho) * full_s.trace + rho * stats_dict["trace"]
+                full_s.anisotropy = (1 - rho) * full_s.anisotropy + rho * stats_dict["anisotropy"]
+                full_s.coherence = (1 - rho) * full_s.coherence + rho * stats_dict["coherence"]
+                if full_s.anchor:
+                    a_old = np.array(full_s.anchor, dtype=np.float32)
                     a_new = (1 - self.cfg.anchor_alpha) * a_old + self.cfg.anchor_alpha * mu
-                    s.anchor = a_new.tolist()
-                    s.anchor_drift = float(np.linalg.norm(a_new - a_old))
+                    full_s.anchor = a_new.tolist()
+                    full_s.anchor_drift = float(np.linalg.norm(a_new - a_old))
                 else:
-                    s.anchor = mu.tolist()
-                    s.anchor_drift = 0.0
+                    full_s.anchor = mu.tolist()
+                    full_s.anchor_drift = 0.0
 
                 var = GeometryMath.covariance_diagonal(embs, weights)
-                s.cov_diagonal = var.tolist()
-                s.node_count = int(embs.shape[0])
-                s.contradiction_density = self._compute_contradiction_signals(s.branch_id)
-                s.regime = self.regime.classify(s)
-                self._update_state_from_regime(s)
-                s.last_update_ts = time.time()
-                self.db.upsert_branch(s)
+                full_s.cov_diagonal = var.tolist()
+                full_s.node_count = int(embs.shape[0])
+                full_s.contradiction_density = self._compute_contradiction_signals(full_s.branch_id)
+                full_s.regime = self.regime.classify(full_s)
+                self._update_state_from_regime(full_s)
+                full_s.last_update_ts = time.time()
+                self.db.upsert_branch(full_s)
                 actions["recomputed"] += 1
-            elif s.mean_vec:
+                s = full_s
+                all_stats[i] = s
+            elif has_mean_by_id.get(s.branch_id, False):
                 s.contradiction_density = self._compute_contradiction_signals(s.branch_id)
                 s.regime = self.regime.classify(s)
                 self._update_state_from_regime(s)
                 s.last_update_ts = time.time()
-                self.db.upsert_branch(s)
+                _persist_branch(s)
                 actions["recomputed"] += 1
 
             prev_state = s.state
@@ -1941,7 +2569,7 @@ class GeometryController:
                     actions["dormant_marked"] += 1
                 elif prev_state == BranchState.DORMANT and s.state == BranchState.REACTIVATING:
                     actions["reactivated"] += 1
-                self.db.upsert_branch(s)
+                _persist_branch(s)
             if s.state == BranchState.DORMANT:
                 # Keep dormant branches out of split accumulation until reactivation.
                 continue
@@ -2025,7 +2653,7 @@ class GeometryController:
                         "obs": split_obs,
                     }
                 )
-            self.db.upsert_branch(s)
+            _persist_branch(s)
 
         if split_candidates:
             split_candidates.sort(key=lambda item: float(item["split_score"]), reverse=True)
@@ -2053,7 +2681,7 @@ class GeometryController:
                         f"eligible_throttled_rank:{rank}>cap:{int(split_enqueue_cap)}"
                     )
                 obs["state_after"] = branch_stats.state.value
-                self.db.upsert_branch(branch_stats)
+                _persist_branch(branch_stats)
 
         for obs in split_observations:
             self.db.log_split_observation(
@@ -2079,9 +2707,33 @@ class GeometryController:
             actions["split_observations"] += 1
 
         stable = [s for s in all_stats if s and s.state in (BranchState.STABLE, BranchState.DORMANT)]
+        mean_map = self.db.load_branch_mean_vectors([s.branch_id for s in stable]) if stable else {}
+        for s in stable:
+            if not s.mean_vec:
+                mv = mean_map.get(s.branch_id)
+                if mv:
+                    s.mean_vec = mv
+
+        stable_by_id = {s.branch_id: s for s in stable}
+        alias_cache = {s.branch_id: self._branch_aliases(s.branch_id) for s in stable}
+        merge_positive_hits: set[str] = set()
+        merge_decay_candidates: set[str] = set()
         for i, s1 in enumerate(stable):
             for s2 in stable[i + 1:]:
-                topic_overlap, retrieval_co_use = self._compute_merge_signals(s1, s2)
+                blocked_merge, _blocked_reason = self._protected_merge_blocked(s1, s2)
+                if blocked_merge:
+                    if int(s1.merge_counter) > 0:
+                        merge_decay_candidates.add(s1.branch_id)
+                    if int(s2.merge_counter) > 0:
+                        merge_decay_candidates.add(s2.branch_id)
+                    continue
+
+                topic_overlap, retrieval_co_use = self._compute_merge_signals(
+                    s1,
+                    s2,
+                    aliases_a=alias_cache.get(s1.branch_id),
+                    aliases_b=alias_cache.get(s2.branch_id),
+                )
                 ms = self.merger.score(
                     s1,
                     s2,
@@ -2089,6 +2741,8 @@ class GeometryController:
                     retrieval_co_use=retrieval_co_use,
                 )
                 if self.merger.should_merge(s1, s2, ms):
+                    merge_positive_hits.add(s1.branch_id)
+                    merge_positive_hits.add(s2.branch_id)
                     s1.merge_counter += 1
                     s2.merge_counter += 1
                     if (
@@ -2109,14 +2763,29 @@ class GeometryController:
                                 },
                             )
                             actions["merge_candidates"] += 1
-                    self.db.upsert_branch(s1)
-                    self.db.upsert_branch(s2)
+                    _persist_branch(s1)
+                    _persist_branch(s2)
+                else:
+                    if int(s1.merge_counter) > 0:
+                        merge_decay_candidates.add(s1.branch_id)
+                    if int(s2.merge_counter) > 0:
+                        merge_decay_candidates.add(s2.branch_id)
+
+        for bid in sorted(merge_decay_candidates - merge_positive_hits):
+            s = stable_by_id.get(bid)
+            if s is None:
+                continue
+            s.merge_counter = max(0, int(s.merge_counter) - 1)
+            _persist_branch(s)
 
         dormant = [s for s in all_stats if s and s.state == BranchState.DORMANT]
         for s in dormant:
-            if float(getattr(s, "reactivation_score", 0.0)) > 0.6:
+            if (
+                float(getattr(s, "reactivation_score", 0.0)) > float(self.cfg.reactivation_min_score)
+                and self._reactivation_guard_ok(s)
+            ):
                 s.state = BranchState.REACTIVATING
-                self.db.upsert_branch(s)
+                _persist_branch(s)
                 actions["reactivated"] += 1
 
         actions["split_executed"] = self.execute_pending_splits(max_jobs=10)
@@ -2174,6 +2843,110 @@ class GeometryController:
             return None
         return max(0.0, (ts - last_activity) / 86400.0)
 
+    def _is_protected_branch_type(self, branch_type: str) -> bool:
+        bt = str(branch_type or "").strip().lower()
+        if not bt:
+            return False
+        raw = getattr(self.cfg, "protected_branch_types", None) or []
+        for x in raw:
+            if str(x).strip().lower() == bt:
+                return True
+        return False
+
+    def _is_supersede_branch_type(self, branch_type: str) -> bool:
+        bt = str(branch_type or "").strip().lower()
+        if not bt:
+            return False
+        raw = getattr(self.cfg, "update_mode_supersede_branch_types", None) or []
+        for x in raw:
+            if str(x).strip().lower() == bt:
+                return True
+        return False
+
+    def _classify_update_mode(
+        self,
+        *,
+        action: str,
+        best_branch: Optional[BranchStats],
+        item_emb: np.ndarray,
+        conflict_score: float,
+        forced_branch: bool = False,
+    ) -> str:
+        act = str(action or "").strip().lower()
+        if act == "fork":
+            return "fork"
+
+        sim = 0.0
+        if best_branch is not None and best_branch.mean_vec:
+            try:
+                sim = float(
+                    GeometryMath.cosine_sim(
+                        item_emb,
+                        np.array(best_branch.mean_vec, dtype=np.float32),
+                    )
+                )
+            except Exception:
+                sim = 0.0
+
+        conflict = float(conflict_score)
+        if (
+            best_branch is not None
+            and self._is_supersede_branch_type(best_branch.branch_type)
+            and conflict >= float(self.cfg.update_mode_supersede_conflict_min)
+            and sim >= float(self.cfg.update_mode_supersede_similarity_min)
+        ):
+            return "supersede"
+
+        if conflict >= float(self.cfg.update_mode_contradict_conflict_min):
+            return "contradict"
+
+        if sim >= float(self.cfg.update_mode_refine_similarity_min):
+            return "refine"
+
+        if forced_branch and conflict <= 0.0 and sim >= 0.5:
+            return "refine"
+        return "attach"
+
+    def _protected_attach_requires_fork(self, s: BranchStats, conflict_score: float) -> tuple[bool, str]:
+        if not self._is_protected_branch_type(s.branch_type):
+            return False, ""
+        if float(conflict_score) >= float(self.cfg.protected_attach_conflict_threshold):
+            return True, "protected_conflict"
+        if float(s.contradiction_density) >= float(self.cfg.protected_attach_contradiction_threshold):
+            return True, "protected_contradiction"
+        return False, ""
+
+    def _protected_merge_blocked(self, s1: BranchStats, s2: BranchStats) -> tuple[bool, str]:
+        protected = self._is_protected_branch_type(s1.branch_type) or self._is_protected_branch_type(s2.branch_type)
+        if not protected:
+            return False, ""
+        if bool(self.cfg.protected_merge_block):
+            return True, "protected_merge_block"
+        th = float(self.cfg.protected_merge_contradiction_threshold)
+        if float(s1.contradiction_density) >= th or float(s2.contradiction_density) >= th:
+            return True, "protected_merge_contradiction"
+        return False, ""
+
+    def _reactivation_guard_ok(
+        self,
+        s: BranchStats,
+        query_embedding: Optional[np.ndarray] = None,
+    ) -> bool:
+        if not bool(getattr(self.cfg, "reactivation_guard_enabled", True)):
+            return True
+        if float(s.contradiction_density) > float(self.cfg.reactivation_max_contradiction):
+            return False
+        if float(s.retrieval_error) > float(self.cfg.reactivation_max_retrieval_error):
+            return False
+        if query_embedding is not None and s.mean_vec:
+            try:
+                sim = GeometryMath.cosine_sim(query_embedding, np.array(s.mean_vec, dtype=np.float32))
+            except Exception:
+                sim = 1.0
+            if float(sim) < float(self.cfg.reactivation_min_similarity):
+                return False
+        return True
+
     def _apply_dormancy_policy(self, s: BranchStats, now_ts: Optional[float] = None) -> bool:
         """
         Apply inactivity/usefulness dormancy policy.
@@ -2195,9 +2968,11 @@ class GeometryController:
         usefulness_ceiling = float(self.cfg.dormant_usefulness_max)
 
         if s.state == BranchState.DORMANT and age_days <= reactivate_days:
-            s.state = BranchState.REACTIVATING
-            s.last_update_ts = float(now_ts if now_ts is not None else time.time())
-            return True
+            if self._reactivation_guard_ok(s):
+                s.state = BranchState.REACTIVATING
+                s.last_update_ts = float(now_ts if now_ts is not None else time.time())
+                return True
+            return False
 
         if s.state == BranchState.REACTIVATING and age_days <= reactivate_days:
             # Give branch a clean path back into active lifecycle after fresh activity.
@@ -2359,9 +3134,17 @@ class GeometryController:
                     aliases.add(f"sn_{lcm_id}")
         return aliases
 
-    def _compute_merge_signals(self, s1: BranchStats, s2: BranchStats) -> tuple[float, float]:
-        aliases_a = self._branch_aliases(s1.branch_id)
-        aliases_b = self._branch_aliases(s2.branch_id)
+    def _compute_merge_signals(
+        self,
+        s1: BranchStats,
+        s2: BranchStats,
+        aliases_a: Optional[set[str]] = None,
+        aliases_b: Optional[set[str]] = None,
+    ) -> tuple[float, float]:
+        if aliases_a is None:
+            aliases_a = self._branch_aliases(s1.branch_id)
+        if aliases_b is None:
+            aliases_b = self._branch_aliases(s2.branch_id)
         edge_counts = self.db.edge_counts_between_sets(aliases_a, aliases_b)
 
         topic_types = {
@@ -2781,15 +3564,36 @@ class GeometryController:
     # Public utility: mark reactivation interest
     # ------------------------------------------------------------------
 
-    def signal_branch_relevance(self, branch_id: str, signal: float = 0.3) -> None:
+    def signal_branch_relevance(
+        self,
+        branch_id: str,
+        signal: float = 0.3,
+        query_embedding: Optional[list[float]] = None,
+    ) -> None:
         """Called when a query semantically aligns with a dormant branch.
         Accumulates reactivation_score adiabatically."""
         s = self.db.load_branch(branch_id)
         if s:
             lam = self.cfg.usefulness_lambda
             s.reactivation_score = (1 - lam) * s.reactivation_score + lam * signal
-            if s.state == BranchState.DORMANT and s.reactivation_score > 0.6:
-                s.state = BranchState.REACTIVATING
+            q_emb: Optional[np.ndarray] = None
+            if query_embedding is not None:
+                try:
+                    q_emb = np.array(query_embedding, dtype=np.float32)
+                except Exception:
+                    q_emb = None
+            if (
+                s.state == BranchState.DORMANT
+                and s.reactivation_score > float(self.cfg.reactivation_min_score)
+            ):
+                if self._reactivation_guard_ok(s, query_embedding=q_emb):
+                    s.state = BranchState.REACTIVATING
+                else:
+                    # Keep signal near threshold if guard fails to avoid unstable wake-flap.
+                    s.reactivation_score = min(
+                        float(s.reactivation_score),
+                        float(self.cfg.reactivation_min_score) * 0.98,
+                    )
             self.db.upsert_branch(s)
 
     # ------------------------------------------------------------------
@@ -2911,6 +3715,9 @@ class GeometryController:
             "node_count":        s.node_count,
             "usefulness":        round(s.usefulness, 3),
             "contradiction_density": round(s.contradiction_density, 3),
+            "update_mode_counts": self.db.branch_update_mode_counts(branch_id),
+            "correction_counts": self.db.branch_correction_counts(branch_id),
+            "recent_corrections": self.db.recent_corrections(branch_id, limit=8),
         }
         if str(branch_id).startswith("day_"):
             out["daily_log_entries"] = self.db.count_daily_log_content(branch_id)
@@ -3073,71 +3880,94 @@ class GeometryController:
                 "poll_lcm_for_new_items requires self.embedding_provider. "
                 "Pass embedding_provider=EmbeddingProvider() to GeometryController."
             )
+        with self._poll_lock:
+            safe_limit = max(1, int(limit))
+            safe_since = max(0, int(since_rowid))
+            lcm = sqlite3.connect(lcm_db_path)
+            lcm.row_factory = sqlite3.Row
 
-        safe_limit = max(1, int(limit))
-        safe_since = max(0, int(since_rowid))
-        lcm = sqlite3.connect(lcm_db_path)
-        lcm.row_factory = sqlite3.Row
+            try:
+                if conversation_id is None:
+                    rows = lcm.execute(
+                        "SELECT rowid AS _rid, message_id, conversation_id, seq, role, content, token_count, created_at "
+                        "FROM messages WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
+                        (safe_since, safe_limit),
+                    ).fetchall()
+                else:
+                    rows = lcm.execute(
+                        "SELECT rowid AS _rid, message_id, conversation_id, seq, role, content, token_count, created_at "
+                        "FROM messages WHERE rowid > ? AND conversation_id = ? ORDER BY rowid ASC LIMIT ?",
+                        (safe_since, int(conversation_id), safe_limit),
+                    ).fetchall()
 
-        try:
-            if conversation_id is None:
-                rows = lcm.execute(
-                    "SELECT rowid AS _rid, message_id, conversation_id, seq, role, content, token_count, created_at "
-                    "FROM messages WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
-                    (safe_since, safe_limit),
-                ).fetchall()
-            else:
-                rows = lcm.execute(
-                    "SELECT rowid AS _rid, message_id, conversation_id, seq, role, content, token_count, created_at "
-                    "FROM messages WHERE rowid > ? AND conversation_id = ? ORDER BY rowid ASC LIMIT ?",
-                    (safe_since, int(conversation_id), safe_limit),
-                ).fetchall()
+                if not rows:
+                    return {
+                        "polled": 0,
+                        "processed": 0,
+                        "failed": 0,
+                        "skipped_duplicates": 0,
+                        "since_rowid": safe_since,
+                        "next_rowid": safe_since,
+                        "has_more": False,
+                    }
 
-            if not rows:
+                lcm_ids = [str(r["message_id"]) for r in rows if r["message_id"] is not None]
+                existing_ids = self.db.existing_lcm_ids(lcm_ids, node_type=NodeType.MESSAGE)
+
+                processed = 0
+                failed = 0
+                skipped_duplicates = 0
+                next_rowid = safe_since
+
+                candidate_rows: list[sqlite3.Row] = []
+                for row in rows:
+                    rid = int(row["_rid"])
+                    next_rowid = max(next_rowid, rid)
+                    msg_id = row["message_id"]
+                    if msg_id is None:
+                        failed += 1
+                        continue
+                    msg_lcm_id = str(msg_id)
+                    if msg_lcm_id in existing_ids:
+                        skipped_duplicates += 1
+                        continue
+                    candidate_rows.append(row)
+
+                if candidate_rows:
+                    texts = [(r["content"] or "")[:1000] for r in candidate_rows]
+                    embeddings = self.embedding_provider.embed_batch(texts)
+                else:
+                    embeddings = []
+
+                for row, emb in zip(candidate_rows, embeddings):
+                    try:
+                        msg_lcm_id = str(row["message_id"])
+                        cid = row["conversation_id"]
+                        branch_id = f"conv_{int(cid)}" if cid is not None else None
+                        self.on_new_item(
+                            lcm_id=msg_lcm_id,
+                            node_type=NodeType.MESSAGE,
+                            embedding=emb,
+                            role=row["role"] or "user",
+                            token_count=int(row["token_count"] or 0),
+                            force_branch_id=branch_id,
+                        )
+                        existing_ids.add(msg_lcm_id)
+                        processed += 1
+                    except Exception:
+                        failed += 1
+
                 return {
-                    "polled": 0,
-                    "processed": 0,
-                    "failed": 0,
+                    "polled": len(rows),
+                    "processed": processed,
+                    "failed": failed,
+                    "skipped_duplicates": skipped_duplicates,
                     "since_rowid": safe_since,
-                    "next_rowid": safe_since,
-                    "has_more": False,
+                    "next_rowid": next_rowid,
+                    "has_more": len(rows) >= safe_limit,
                 }
-
-            texts = [(r["content"] or "")[:1000] for r in rows]
-            embeddings = self.embedding_provider.embed_batch(texts)
-
-            processed = 0
-            failed = 0
-            next_rowid = safe_since
-
-            for row, emb in zip(rows, embeddings):
-                rid = int(row["_rid"])
-                next_rowid = max(next_rowid, rid)
-                try:
-                    cid = row["conversation_id"]
-                    active = f"conv_{int(cid)}" if cid is not None else None
-                    self.on_new_item(
-                        lcm_id=str(row["message_id"]),
-                        node_type=NodeType.MESSAGE,
-                        embedding=emb,
-                        role=row["role"] or "user",
-                        token_count=int(row["token_count"] or 0),
-                        active_branch_id=active,
-                    )
-                    processed += 1
-                except Exception:
-                    failed += 1
-
-            return {
-                "polled": len(rows),
-                "processed": processed,
-                "failed": failed,
-                "since_rowid": safe_since,
-                "next_rowid": next_rowid,
-                "has_more": len(rows) >= safe_limit,
-            }
-        finally:
-            lcm.close()
+            finally:
+                lcm.close()
 
     # ------------------------------------------------------------------
     # Fix 4 - Import DAG edges from LCM
