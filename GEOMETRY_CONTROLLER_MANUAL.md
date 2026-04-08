@@ -1,10 +1,10 @@
 # LCM Geometry Controller — Manual
 
-**Version:** 1.4
+**Version:** 1.5
 **Module:** `lcm_geometry_controller.py`
 **Geometry DB:** `<openclaw_home>/lcm_geometry.db`
 **LCM DB:** `<openclaw_home>/lcm.db`
-**Last Updated:** 2026-04-08
+**Last Updated:** 2026-04-09
 
 ---
 
@@ -359,7 +359,18 @@ Reads:
 - `summary_parents` → `DERIVED_FROM` edges (parent_summary → child_summary)
 - `summary_messages` → `SUMMARIZES` edges (summary → message)
 
-**Returns:** `dict` with `derived_from`, `summarizes`, `skipped` counts.
+Behavior:
+- Purges previously imported `DERIVED_FROM` / `SUMMARIZES` edges before rebuild.
+- Resolves LCM IDs to real geometry node IDs (`memory_nodes.id`) by `(lcm_id, node_type)`.
+- Skips rows where required nodes are not present in geometry DB.
+
+**Returns:** `dict` with:
+- `derived_from`
+- `summarizes`
+- `skipped`
+- `purged`
+- `summary_nodes_indexed`
+- `message_nodes_indexed`
 
 ### `gc.audit_summary(summary_id, embedding=None, text=None)`
 
@@ -614,16 +625,26 @@ These edges enable:
 - **`topic_overlap`** in merge scoring — two branches share summaries → high topic overlap → merge candidate
 - **`retrieval_co_use`** — branches that share message ancestors are related
 
-**Results from last import:**
-- 435 `DERIVED_FROM` edges
-- 16,021 `SUMMARIZES` edges
-- Total: 16,456 edges
+Current importer guarantees node-level consistency:
+- imported edges always target real `memory_nodes.id`
+- stale imported edges are removed before rebuild
+- integrity can be verified by orphan counters (`0` is expected)
+
+Notes:
+- This import currently uses `summary_parents` and `summary_messages`.
+- Message reply-thread import (`REPLIES_TO` / `CHILD_OF`) is not available in the current `lcm.db` schema because `messages.parent_id` is not present.
+
+**Results from latest live rebuild (2026-04-09):**
+- 443 `DERIVED_FROM` edges
+- 17,250 `SUMMARIZES` edges
+- 847 skipped rows (missing summary/message nodes in geometry DB)
+- orphan counts after rebuild: `0` for `derived_from` and `summarizes`
 
 ---
 
 ## 12. MCP Server Tools
 
-The OpenClaw MCP server (`<openclaw_home>/extensions/geometry-mcp/server.py`) exposes five tools:
+The OpenClaw MCP server (`<openclaw_home>/extensions/geometry-mcp/server.py`) exposes six tools:
 
 ### `geometry-hybrid__hybrid_search`
 
@@ -665,6 +686,20 @@ geometry-hybrid__sync_lcm_ingest(limit=200)
 
 Returns: processed/failed counters, rowid cursor movement, and `has_more`.
 
+### `geometry-hybrid__sync_lcm_dag_edges`
+
+Force DAG edge rebuild from LCM summary tables into geometry DB and return integrity counters.
+
+```
+geometry-hybrid__sync_lcm_dag_edges(backup=true)
+```
+
+Returns:
+- backup path (or disabled)
+- import stats (`summarizes`, `derived_from`, `skipped`, `purged`)
+- indexed-node counts
+- validation totals + orphan counters by edge type
+
 ### `geometry-hybrid__conversation_content`
 
 Bridge from geometry branch IDs to real LCM content. Use this after `hybrid_search` when you need summaries/messages from selected branches.
@@ -681,6 +716,14 @@ Supports:
 - `branch_id="conv_N"` for one conversation
 - `state="ACTIVE" | "STABLE" | "FORMING" | "ALL"` for batch mode
 - `content_type="summaries" | "messages" | "both" | "logs"`
+
+Resolution metadata:
+- `resolution_mode`: `branch_lineage` | `suffix_fallback` | `daily_log`
+- `resolved_conversation_ids`: LCM conversation IDs actually used
+- `warning` when relevant:
+  - `branch_suffix_mismatch:conv_X->conv_Y`
+  - `mixed_branch_content:<ids>`
+  - `lineage_empty_used_suffix_fallback`
 
 ### MCP Server Registration
 
@@ -766,6 +809,11 @@ The current controller build includes these production features:
 26. **Optional duplicate cleanup utility**:
     - `scripts/cleanup_geometry_duplicates.py` for one-time repair of legacy duplicate-ingest inflation
     - creates backup, dedupes message rows, rebuilds affected edges/metadata, and can run one maintenance cycle
+27. **Lineage-aware content resolution**:
+    - `conversation_content` resolves branch text from actual geometry node lineage instead of branch suffix only
+    - exposes mismatch/mixed warnings and resolved conversation IDs
+28. **DAG edge sync admin tool**:
+    - `sync_lcm_dag_edges` rebuilds imported DAG edges and reports orphan validation counters in one command
 
 ---
 
@@ -843,6 +891,24 @@ python3 scripts/cleanup_geometry_duplicates.py \
   --run-maintenance
 ```
 
+### `conversation_content` warns about branch suffix mismatch
+
+If you see:
+```
+branch_suffix_mismatch:conv_X->conv_Y
+```
+that means branch content lineage points to a different LCM conversation than the branch suffix.
+This is expected for split-derived branches and is now handled correctly by lineage resolution.
+
+### Imported DAG edges need consistency refresh
+
+Run MCP tool:
+```
+geometry-hybrid__sync_lcm_dag_edges(backup=true)
+```
+
+Use returned orphan counters to verify integrity (`derived_from=0`, `summarizes=0` expected).
+
 ### Maintenance cycle not recomputing all branches
 
 If `recomputed` count is low despite Fix 5 being applied, check:
@@ -917,7 +983,7 @@ gc.backfill_from_lcm('<openclaw_home>/lcm.db', resume=True)
 
 ---
 
-*Manual generated: 2026-04-06*
+*Manual generated: 2026-04-09*
 *Module: `<module_repo_root>/lcm_geometry_controller.py`*
 *Companion backfill script: `<module_repo_root>/lcm_geometry_backfill.py`*
 *MCP server: `<openclaw_home>/extensions/geometry-mcp/server.py`*

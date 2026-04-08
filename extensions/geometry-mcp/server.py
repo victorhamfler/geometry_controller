@@ -19,6 +19,7 @@ import os
 import json
 import time
 import threading
+import shutil
 
 # Resolve workspace/module path  going up from extensions/geometry-mcp/  extensions/  ~/.openclaw/
 SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -206,6 +207,61 @@ def _with_poll_lag(status: dict, cursor_rowid: int | None = None) -> dict:
         if POLLING_DEBUG_LOG:
             print(f"[geometry-mcp] Failed to compute poll lag: {exc}", file=sys.stderr)
     return out
+
+
+def _backup_geo_db_copy() -> str:
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    dst = f"{GEO_DB}.backup_dag_sync_{ts}"
+    shutil.copy2(GEO_DB, dst)
+    return dst
+
+
+def _dag_edge_validation_summary() -> dict:
+    conn = sqlite3.connect(GEO_DB)
+    conn.row_factory = sqlite3.Row
+    try:
+        out = {
+            "by_type": {},
+            "orphan_by_type": {},
+            "total_edges": 0,
+        }
+        for et in ("summarizes", "derived_from", "temporal_next", "refines"):
+            total = conn.execute(
+                "SELECT COUNT(*) AS c FROM memory_edges WHERE edge_type=?",
+                (et,),
+            ).fetchone()["c"]
+            orphan = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM memory_edges e
+                LEFT JOIN memory_nodes s ON s.id=e.src_id
+                LEFT JOIN memory_nodes d ON d.id=e.dst_id
+                WHERE e.edge_type=? AND (s.id IS NULL OR d.id IS NULL)
+                """,
+                (et,),
+            ).fetchone()["c"]
+            out["by_type"][et] = int(total or 0)
+            out["orphan_by_type"][et] = int(orphan or 0)
+            out["total_edges"] += int(total or 0)
+        return out
+    finally:
+        conn.close()
+
+
+def _sync_lcm_dag_edges(backup: bool = True) -> dict:
+    with _poll_lock:
+        backup_path = None
+        if backup:
+            backup_path = _backup_geo_db_copy()
+        gc = get_gc()
+        import_stats = gc.import_dag_edges_from_lcm(LCM_DB)
+        validation = _dag_edge_validation_summary()
+        return {
+            "ok": True,
+            "backup_path": backup_path,
+            "import_stats": import_stats,
+            "validation": validation,
+        }
 
 
 def _poll_lcm_if_due(force: bool = False, limit_override: int | None = None) -> dict:
@@ -572,7 +628,12 @@ def _get_lcm_content(lcm_conn, conv_id, content_type, max_entries, max_chars):
             (max_chars, conv_id)
         )
         for r in cur.fetchall():
-            entries.append({"type": "summary", "kind": r["kind"], "text": r["text"]})
+            entries.append({
+                "type": "summary",
+                "kind": r["kind"],
+                "conversation_id": int(conv_id),
+                "text": r["text"],
+            })
 
     if content_type in ("messages", "both"):
         cur = lcm_conn.execute(
@@ -581,9 +642,192 @@ def _get_lcm_content(lcm_conn, conv_id, content_type, max_entries, max_chars):
             (max_chars, conv_id, max_entries)
         )
         for r in cur.fetchall():
-            entries.append({"type": "message", "role": r["role"], "created_at": r["created_at"], "text": r["text"]})
+            entries.append({
+                "type": "message",
+                "role": r["role"],
+                "conversation_id": int(conv_id),
+                "created_at": r["created_at"],
+                "text": r["text"],
+            })
 
     return entries
+
+
+def _parse_conv_branch_id(branch_id):
+    try:
+        text = str(branch_id or "")
+        if not text.startswith("conv_"):
+            return None
+        return int(text.replace("conv_", "", 1))
+    except Exception:
+        return None
+
+
+def _chunked(seq, size=400):
+    safe = max(1, int(size))
+    for i in range(0, len(seq), safe):
+        yield seq[i:i + safe]
+
+
+def _ordered_unique(seq):
+    out = []
+    seen = set()
+    for x in seq:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+def _append_resolution_warning(meta, warning_text):
+    if not warning_text:
+        return
+    existing = str(meta.get("warning", "") or "").strip()
+    if not existing:
+        meta["warning"] = str(warning_text)
+    elif warning_text not in existing:
+        meta["warning"] = f"{existing}; {warning_text}"
+
+
+def _resolve_branch_lcm_ids(gdb_conn, branch_id):
+    rows = gdb_conn.execute(
+        "SELECT lcm_id, node_type FROM memory_nodes "
+        "WHERE branch_id = ? ORDER BY timestamp ASC, rowid ASC",
+        (branch_id,),
+    ).fetchall()
+    message_ids = []
+    summary_ids = []
+    for r in rows:
+        lcm_id = r["lcm_id"]
+        node_type = str(r["node_type"] or "").strip().lower()
+        if lcm_id is None:
+            continue
+        lid = str(lcm_id).strip()
+        if not lid:
+            continue
+        if node_type == "message":
+            try:
+                message_ids.append(int(lid))
+            except Exception:
+                continue
+            continue
+        if node_type in ("summary", "leaf_summary", "condensed_summary"):
+            summary_ids.append(lid)
+            continue
+        if lid.startswith("sum_"):
+            summary_ids.append(lid)
+            continue
+        try:
+            message_ids.append(int(lid))
+        except Exception:
+            continue
+    return _ordered_unique(message_ids), _ordered_unique(summary_ids)
+
+
+def _count_resolved_conversations(lcm_conn, message_ids, summary_ids):
+    counts = defaultdict(int)
+    for chunk in _chunked(message_ids):
+        placeholders = ",".join("?" for _ in chunk)
+        sql = (
+            "SELECT conversation_id, COUNT(*) AS n FROM messages "
+            f"WHERE message_id IN ({placeholders}) GROUP BY conversation_id"
+        )
+        for r in lcm_conn.execute(sql, chunk).fetchall():
+            counts[int(r["conversation_id"])] += int(r["n"] or 0)
+    for chunk in _chunked(summary_ids):
+        placeholders = ",".join("?" for _ in chunk)
+        sql = (
+            "SELECT conversation_id, COUNT(*) AS n FROM summaries "
+            f"WHERE summary_id IN ({placeholders}) GROUP BY conversation_id"
+        )
+        for r in lcm_conn.execute(sql, chunk).fetchall():
+            counts[int(r["conversation_id"])] += int(r["n"] or 0)
+    return counts
+
+
+def _get_branch_lineage_content(gdb_conn, lcm_conn, branch_id, content_type, max_entries, max_chars):
+    message_ids, summary_ids = _resolve_branch_lcm_ids(gdb_conn, branch_id)
+    conv_counts = _count_resolved_conversations(lcm_conn, message_ids, summary_ids)
+    ordered_conv_ids = [
+        int(k) for k, _v in sorted(conv_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+
+    meta = {
+        "resolution_mode": "branch_lineage",
+        "resolved_conversation_ids": ordered_conv_ids,
+    }
+
+    entries = []
+    if content_type in ("summaries", "both"):
+        summary_rows = []
+        for chunk in _chunked(summary_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            sql = (
+                "SELECT summary_id, conversation_id, kind, created_at, "
+                "SUBSTR(content, 1, ?) AS text "
+                f"FROM summaries WHERE summary_id IN ({placeholders})"
+            )
+            params = [max_chars]
+            params.extend(chunk)
+            summary_rows.extend(lcm_conn.execute(sql, params).fetchall())
+        summary_rows.sort(key=lambda r: (str(r["created_at"] or ""), str(r["summary_id"] or "")))
+        for r in summary_rows:
+            entries.append({
+                "type": "summary",
+                "kind": r["kind"],
+                "conversation_id": int(r["conversation_id"]),
+                "text": r["text"],
+            })
+
+    if content_type in ("messages", "both"):
+        message_rows = []
+        for chunk in _chunked(message_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            sql = (
+                "SELECT message_id, conversation_id, role, seq, created_at, "
+                "SUBSTR(content, 1, ?) AS text "
+                f"FROM messages WHERE message_id IN ({placeholders})"
+            )
+            params = [max_chars]
+            params.extend(chunk)
+            message_rows.extend(lcm_conn.execute(sql, params).fetchall())
+        message_rows.sort(key=lambda r: (str(r["created_at"] or ""), int(r["seq"] or 0)))
+        for r in message_rows:
+            entries.append({
+                "type": "message",
+                "role": r["role"],
+                "conversation_id": int(r["conversation_id"]),
+                "created_at": r["created_at"],
+                "text": r["text"],
+            })
+
+    if len(ordered_conv_ids) > 1:
+        _append_resolution_warning(
+            meta,
+            f"mixed_branch_content:{','.join(str(x) for x in ordered_conv_ids[:8])}",
+        )
+
+    suffix_conv_id = _parse_conv_branch_id(branch_id)
+    if suffix_conv_id is not None and ordered_conv_ids:
+        if suffix_conv_id != ordered_conv_ids[0]:
+            _append_resolution_warning(
+                meta,
+                f"branch_suffix_mismatch:conv_{suffix_conv_id}->conv_{ordered_conv_ids[0]}",
+            )
+
+    # Fallback path for branches with empty lineage (e.g. collapsed roots).
+    if not entries and suffix_conv_id is not None:
+        fallback_entries = _get_lcm_content(
+            lcm_conn, suffix_conv_id, content_type, max_entries=max_entries, max_chars=max_chars
+        )
+        if fallback_entries:
+            meta["resolution_mode"] = "suffix_fallback"
+            meta["resolved_conversation_ids"] = [suffix_conv_id]
+            _append_resolution_warning(meta, "lineage_empty_used_suffix_fallback")
+            entries = fallback_entries
+
+    return entries[:max_entries], meta
 
 def do_conversation_content(branch_id=None, state=None, content_type="summaries", max_entries=100, max_chars=250):
     """Retrieve actual conversation text from LCM for geometry-identified branches.
@@ -608,14 +852,22 @@ def do_conversation_content(branch_id=None, state=None, content_type="summaries"
             return {"error": f"Branch {branch_id} not found"}
         if str(branch_id).startswith("day_") or content_type == "logs":
             entries = _get_daily_log_content(gdb, branch_id, max_entries, max_chars)
+            resolution_meta = {
+                "resolution_mode": "daily_log",
+                "resolved_conversation_ids": [],
+            }
         else:
-            cid = int(branch_id.replace("conv_", ""))
-            entries = _get_lcm_content(lcm, cid, content_type, max_entries, max_chars)
+            entries, resolution_meta = _get_branch_lineage_content(
+                gdb, lcm, branch_id, content_type, max_entries, max_chars
+            )
         results.append({
             "branch_id": branch_id,
             "state": b["state"],
             "regime": b["regime"],
             "entries_returned": len(entries),
+            "resolution_mode": resolution_meta.get("resolution_mode", "unknown"),
+            "resolved_conversation_ids": resolution_meta.get("resolved_conversation_ids", []),
+            "warning": resolution_meta.get("warning"),
             "content": entries
         })
     else:
@@ -654,14 +906,22 @@ def do_conversation_content(branch_id=None, state=None, content_type="summaries"
         for b in branches:
             if str(b["branch_id"]).startswith("day_") or content_type == "logs":
                 entries = _get_daily_log_content(gdb, b["branch_id"], per_branch, max_chars)
+                resolution_meta = {
+                    "resolution_mode": "daily_log",
+                    "resolved_conversation_ids": [],
+                }
             else:
-                cid = int(b["branch_id"].replace("conv_", ""))
-                entries = _get_lcm_content(lcm, cid, content_type, per_branch, max_chars)
+                entries, resolution_meta = _get_branch_lineage_content(
+                    gdb, lcm, b["branch_id"], content_type, per_branch, max_chars
+                )
             results.append({
                 "branch_id": b["branch_id"],
                 "state": b["state"],
                 "regime": b["regime"],
                 "entries_returned": len(entries),
+                "resolution_mode": resolution_meta.get("resolution_mode", "unknown"),
+                "resolved_conversation_ids": resolution_meta.get("resolved_conversation_ids", []),
+                "warning": resolution_meta.get("warning"),
                 "content": entries
             })
 
@@ -753,6 +1013,22 @@ async def list_tools():
             }
         ),
         Tool(
+            name="sync_lcm_dag_edges",
+            description=(
+                "Rebuild summary DAG edges (summarizes/derived_from) from lcm.db into geometry DB "
+                "using real geometry node IDs, then return validation counters (including orphan counts)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "backup": {
+                        "type": "boolean",
+                        "description": "Create a DB backup before rebuild (default true)."
+                    }
+                }
+            }
+        ),
+        Tool(
             name="conversation_content",
             description=(
                 "Retrieve actual conversation text from the LCM database for geometry-identified branches. "
@@ -795,7 +1071,7 @@ async def list_tools():
 async def call_tool(name, arguments):
     try:
         auto_poll_status = None
-        if name != "sync_lcm_ingest":
+        if name not in ("sync_lcm_ingest", "sync_lcm_dag_edges"):
             auto_poll_status = _poll_lcm_if_due(force=False)
         poll_line = _poll_status_line(auto_poll_status)
 
@@ -892,6 +1168,46 @@ async def call_tool(name, arguments):
                 lines.append(f"  Skipped duplicates: {status.get('skipped_duplicates')}")
             return [TextContent(type="text", text="\n".join(lines))]
 
+        elif name == "sync_lcm_dag_edges":
+            backup = arguments.get("backup", True)
+            do_backup = True if backup is None else bool(backup)
+            result = _sync_lcm_dag_edges(backup=do_backup)
+            if not result.get("ok"):
+                return [TextContent(type="text", text=f"Error: {result.get('error', 'unknown error')}")]
+            stats = result.get("import_stats", {})
+            val = result.get("validation", {})
+            by_type = val.get("by_type", {})
+            orphan = val.get("orphan_by_type", {})
+            lines = [" LCM DAG Edge Sync"]
+            lines.append(f"  Backup: {result.get('backup_path') or '(disabled)'}")
+            lines.append(
+                "  Imported: "
+                f"summarizes={stats.get('summarizes', 0)} "
+                f"derived_from={stats.get('derived_from', 0)} "
+                f"skipped={stats.get('skipped', 0)} "
+                f"purged={stats.get('purged', 0)}"
+            )
+            lines.append(
+                "  Indexed nodes: "
+                f"summary={stats.get('summary_nodes_indexed', 0)} "
+                f"message={stats.get('message_nodes_indexed', 0)}"
+            )
+            lines.append(
+                "  Validation totals: "
+                f"summarizes={by_type.get('summarizes', 0)} "
+                f"derived_from={by_type.get('derived_from', 0)} "
+                f"temporal_next={by_type.get('temporal_next', 0)} "
+                f"refines={by_type.get('refines', 0)}"
+            )
+            lines.append(
+                "  Validation orphans: "
+                f"summarizes={orphan.get('summarizes', 0)} "
+                f"derived_from={orphan.get('derived_from', 0)} "
+                f"temporal_next={orphan.get('temporal_next', 0)} "
+                f"refines={orphan.get('refines', 0)}"
+            )
+            return [TextContent(type="text", text="\n".join(lines))]
+
         elif name == "conversation_content":
             branch_id = arguments.get("branch_id")
             state = arguments.get("state")
@@ -917,14 +1233,24 @@ async def call_tool(name, arguments):
                 lines.insert(1, poll_line)
 
             for r in result['results']:
-                lines.append(f"--- {r['branch_id']} | {r['state']}/{r['regime']} | {r['entries_returned']} entries ---")
+                resolved_ids = r.get("resolved_conversation_ids") or []
+                resolved_text = ",".join(str(x) for x in resolved_ids[:8]) if resolved_ids else "-"
+                lines.append(
+                    f"--- {r['branch_id']} | {r['state']}/{r['regime']} | "
+                    f"{r['entries_returned']} entries | mode={r.get('resolution_mode','unknown')} "
+                    f"| resolved_conv={resolved_text} ---"
+                )
+                if r.get("warning"):
+                    lines.append(f"  [warning] {r['warning']}")
                 for e in r['content']:
                     if e['type'] == 'summary':
-                        lines.append(f"\n  [{e['type'].upper()}/{e['kind']}] {e['text']}")
+                        conv_note = f" conv={e['conversation_id']}" if "conversation_id" in e else ""
+                        lines.append(f"\n  [{e['type'].upper()}/{e['kind']}{conv_note}] {e['text']}")
                     elif e['type'] == 'daily_log':
                         lines.append(f"\n  [DAILY_LOG/{e.get('source','manual_log')}] {e['text']}")
                     else:
-                        lines.append(f"\n  [{e['role']}] {e['text']}")
+                        conv_note = f" conv={e['conversation_id']}" if "conversation_id" in e else ""
+                        lines.append(f"\n  [{e['role']}{conv_note}] {e['text']}")
                 lines.append("")
 
             return [TextContent(type="text", text="\n".join(lines))]

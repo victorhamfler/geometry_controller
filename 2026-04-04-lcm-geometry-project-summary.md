@@ -1,7 +1,7 @@
 ﻿# LCM Geometry Module - Project Summary
 
 **Status:** Active (OpenClaw + MCP runtime)
-**Last Updated:** 2026-04-08
+**Last Updated:** 2026-04-09
 
 ## Purpose
 
@@ -83,6 +83,13 @@ This project adds a semantic geometry layer on top of OpenClaw LCM memory.
   - manual force tool: `sync_lcm_ingest`
   - duplicate-safe polling path (skips existing message ids)
   - polling lag telemetry (`lag_rows`, `cursor_rowid`, `lcm_max_rowid`)
+- Lineage-aware content resolution:
+  - `conversation_content` resolves by branch lineage (`memory_nodes.lcm_id`) instead of branch suffix alone
+  - emits `resolution_mode`, `resolved_conversation_ids`, and mapping/mixing warnings
+- DAG edge import integrity:
+  - `import_dag_edges_from_lcm(...)` rebuilds `summarizes` / `derived_from` with real geometry node IDs
+  - importer purges stale imported edges before rebuild and reports indexed-node/skipped stats
+  - MCP admin tool `sync_lcm_dag_edges` performs one-command rebuild + orphan validation counters
 - Runtime config support in MCP server:
   - optional `extensions/geometry-mcp/runtime_config.json`
   - env override `GEOMETRY_RUNTIME_CONFIG_JSON`
@@ -131,12 +138,15 @@ openclaw mcp list
 - `hybrid_search`
 - `branch_report`
 - `geometry_stats`
+- `sync_lcm_ingest`
+- `sync_lcm_dag_edges`
 - `conversation_content`
 
 ## Operational notes
 
 - Backfill is the key synchronization step between LCM and geometry.
 - For incremental ingest, use `poll_lcm_for_new_items(...)` with a persisted rowid cursor.
+- For imported summary DAG integrity, run `sync_lcm_dag_edges` and verify orphan counters are zero.
 - If retrieval quality drops or results look stale, run backfill again.
 - `GEOMETRY_CONTROLLER_MANUAL.md` is the full reference.
 - `GEOMETRY_MODULE_TUTORIAL.md` is the practical user/agent guide.

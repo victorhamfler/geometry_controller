@@ -1,8 +1,8 @@
 ﻿# LCM Geometry Module - User and Agent Tutorial
 
-**Version:** 1.3
+**Version:** 1.4
 **Module:** `lcm_geometry_controller.py`
-**Last Updated:** 2026-04-08
+**Last Updated:** 2026-04-09
 
 This tutorial explains how to use the geometry module as a semantic companion to OpenClaw LCM.
 
@@ -38,19 +38,28 @@ Current runtime uses inactivity + usefulness policy to move ACTIVE/STABLE/TENSIO
 
 ## 3. MCP tools
 
-Use these 5 tools exposed by `geometry-hybrid`:
+Use these 6 tools exposed by `geometry-hybrid`:
 
 - `geometry-hybrid__hybrid_search`: combined semantic + keyword ranking.
 - `geometry-hybrid__conversation_content`: read summaries/messages for a branch (`conv_*`).
 - `geometry-hybrid__branch_report`: inspect one branch (state/regime/metrics + `update_mode_counts`).
 - `geometry-hybrid__geometry_stats`: global geometry DB health metrics.
 - `geometry-hybrid__sync_lcm_ingest`: force one incremental LCM->geometry ingest poll.
+- `geometry-hybrid__sync_lcm_dag_edges`: rebuild imported DAG edges and return orphan-validation counters.
 
 Recommended flow: `hybrid_search` -> `branch_report` (if needed) -> `conversation_content`.
 
 `sync_lcm_ingest` output now includes:
 - `skipped_duplicates` (already-ingested messages in requested row window)
 - `lag_rows` + rowid cursor status (`next_rowid` vs `lcm_max_rowid`)
+
+`conversation_content` output now includes:
+- `resolution_mode` (`branch_lineage`, `suffix_fallback`, `daily_log`)
+- `resolved_conversation_ids` (which LCM conversations were actually used)
+- optional warnings for mapping/mixing:
+  - `branch_suffix_mismatch:conv_X->conv_Y`
+  - `mixed_branch_content:<ids>`
+  - `lineage_empty_used_suffix_fallback`
 
 For `hybrid_search`, use:
 - `retrieval_mode="factual"` when precision/reliability matters.
@@ -65,6 +74,7 @@ For `hybrid_search`, use:
 2. Prioritize strong semantic candidates and healthy branch signals.
 3. Pull summaries first via `conversation_content`.
 4. Expand to messages only when needed for evidence.
+5. Run `sync_lcm_dag_edges` after major backfill/import refreshes.
 
 ---
 
@@ -180,9 +190,23 @@ while True:
 
 This preserves a rowid cursor and processes only new messages.
 
+## 8. DAG edge integrity sync (admin)
+
+When you need to refresh imported summary DAG links (`summarizes`, `derived_from`) from LCM:
+
+```
+geometry-hybrid__sync_lcm_dag_edges(backup=true)
+```
+
+Expected healthy validation:
+- `orphan_by_type.summarizes = 0`
+- `orphan_by_type.derived_from = 0`
+
+Use `backup=false` only when you explicitly do not want a pre-sync DB backup.
+
 ---
 
-## 8. Operating tips
+## 9. Operating tips
 
 - Run `run_maintenance_cycle()` periodically (for example every 20-30 minutes).
 - Maintenance is scalar-first: branch blobs are only loaded when full recompute/merge vectors are needed.
@@ -193,6 +217,6 @@ This preserves a rowid cursor and processes only new messages.
 
 ---
 
-## 9. Summary
+## 10. Summary
 
 The geometry module improves memory retrieval quality by adding semantic structure on top of LCM history. It complements LCM; it does not replace it.

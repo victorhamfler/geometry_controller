@@ -2,7 +2,7 @@
 
 Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geometry-aware tools.
 
-## Latest Update (2026-04-08)
+## Latest Update (2026-04-09)
 
 - Added scalar/lazy branch loading paths:
   - retrieval prefilter by branch scalars (`retrieval_prefilter_limit`)
@@ -40,6 +40,17 @@ Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geomet
   - polling status now exposes lag telemetry (`lag_rows`, `lcm_max_rowid`, `cursor_rowid`)
   - manual force-sync MCP tool: `sync_lcm_ingest`
   - polling behavior configurable via top-level `polling` config block
+- Fixed `conversation_content` branch mapping:
+  - content resolution now uses actual branch lineage from geometry nodes (`memory_nodes.lcm_id`)
+  - no longer assumes `conv_<suffix>` equals LCM `conversation_id`
+  - per-branch output now includes `resolution_mode`, `resolved_conversation_ids`, and warnings:
+    - `branch_suffix_mismatch:conv_X->conv_Y`
+    - `mixed_branch_content:<ids>`
+    - `lineage_empty_used_suffix_fallback`
+- Fixed DAG edge import integrity:
+  - `import_dag_edges_from_lcm(...)` now maps LCM IDs to real geometry node IDs before writing edges
+  - imported `summarizes`/`derived_from` edges are rebuilt cleanly (old imported edges purged first)
+  - added MCP admin tool `sync_lcm_dag_edges` for one-command rebuild + validation counters
 - Added safe schema migration for lifecycle persistence:
   - auto-adds `reactivation_score` column on existing DBs when missing
 - Added protected-memory hard gates:
@@ -231,14 +242,16 @@ Useful keys in `geometry_config`:
 - `branch_report` - branch diagnostics (state, regime, rank/coherence/anisotropy, etc.)
 - `geometry_stats` - global DB health and distribution stats
 - `sync_lcm_ingest` - force one incremental ingest poll from `lcm.db` into geometry DB
-- `conversation_content` - geometry-to-LCM text bridge (summaries/messages by branch/state)
+- `sync_lcm_dag_edges` - rebuild imported DAG edges (`summarizes`, `derived_from`) and return orphan-validation counters
+- `conversation_content` - geometry-to-LCM text bridge (summaries/messages by branch/state) with lineage-aware resolution metadata
 
 ## Typical usage flow
 
 1. Use `hybrid_search` for first-pass recall.
 2. Inspect top branch with `branch_report` when needed.
 3. Pull text evidence with `conversation_content`.
-4. Re-run `lcm_geometry_backfill.py` periodically to keep geometry aligned with latest LCM data.
+4. Run `sync_lcm_dag_edges` after major backfill/import refreshes to keep DAG link integrity validated.
+5. Re-run `lcm_geometry_backfill.py` periodically to keep geometry aligned with latest LCM data.
 
 ## Troubleshooting
 
@@ -246,6 +259,7 @@ Useful keys in `geometry_config`:
 - `ModuleNotFoundError: lcm_geometry_controller`: ensure file is present in `<openclaw_home>/workspace/module`.
 - MCP server not visible: re-run `openclaw mcp set ...` and restart gateway.
 - Empty semantic results: run backfill to populate/refresh `lcm_geometry.db`.
+- Imported DAG links look inconsistent: run `sync_lcm_dag_edges` (default creates a DB backup and reports orphan counts).
 
 ## License
 

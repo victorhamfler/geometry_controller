@@ -3985,34 +3985,111 @@ class GeometryController:
         topic_overlap and retrieval_co_use.
 
         Returns:
-            {"derived_from": N, "summarizes": M, "skipped": K}
+            {
+              "derived_from": N,
+              "summarizes": M,
+              "skipped": K,
+              "purged": P,
+              "summary_nodes_indexed": S,
+              "message_nodes_indexed": M
+            }
         """
         lcm = sqlite3.connect(lcm_db_path)
         lcm.row_factory = sqlite3.Row
-        stats = {"derived_from": 0, "summarizes": 0, "skipped": 0}
+        stats = {
+            "derived_from": 0,
+            "summarizes": 0,
+            "skipped": 0,
+            "purged": 0,
+            "summary_nodes_indexed": 0,
+            "message_nodes_indexed": 0,
+        }
+
+        # Rebuild imported DAG edge types from scratch to avoid stale/orphaned links.
+        purged = self.db.conn.execute(
+            "DELETE FROM memory_edges WHERE edge_type IN (?, ?)",
+            (EdgeType.DERIVED_FROM.value, EdgeType.SUMMARIZES.value),
+        )
+        self.db.conn.commit()
+        stats["purged"] = int(purged.rowcount or 0)
+
+        # Build latest-node lookup by LCM id.
+        summary_map: dict[str, str] = {}
+        summary_rows = self.db.conn.execute(
+            """
+            SELECT id, lcm_id
+            FROM memory_nodes
+            WHERE lcm_id IS NOT NULL
+              AND node_type IN ('summary', 'leaf_summary', 'condensed_summary')
+            ORDER BY timestamp DESC, rowid DESC
+            """
+        ).fetchall()
+        for r in summary_rows:
+            sid = str(r["lcm_id"] or "").strip()
+            if sid and sid not in summary_map:
+                summary_map[sid] = str(r["id"])
+        stats["summary_nodes_indexed"] = len(summary_map)
+
+        message_map: dict[str, str] = {}
+        message_rows = self.db.conn.execute(
+            """
+            SELECT id, lcm_id
+            FROM memory_nodes
+            WHERE lcm_id IS NOT NULL
+              AND node_type=?
+            ORDER BY timestamp DESC, rowid DESC
+            """,
+            (NodeType.MESSAGE.value,),
+        ).fetchall()
+        for r in message_rows:
+            mid = str(r["lcm_id"] or "").strip()
+            if mid and mid not in message_map:
+                message_map[mid] = str(r["id"])
+        stats["message_nodes_indexed"] = len(message_map)
+
+        batch: list[tuple[str, str, EdgeType, float]] = []
+
+        def flush_batch() -> None:
+            nonlocal batch
+            if batch:
+                self.db.add_edges_bulk(batch)
+                batch = []
 
         # summary_parents: (summary_id, parent_summary_id) — DERIVED_FROM
         for row in lcm.execute("SELECT summary_id, parent_summary_id FROM summary_parents"):
-            if row["summary_id"] and row["parent_summary_id"]:
-                try:
-                    self.db.add_edge(
-                        f"sn_{row['parent_summary_id']}", f"sn_{row['summary_id']}",
-                        EdgeType.DERIVED_FROM,
-                    )
-                    stats["derived_from"] += 1
-                except Exception:
-                    stats["skipped"] += 1
+            child_sid = str(row["summary_id"] or "").strip()
+            parent_sid = str(row["parent_summary_id"] or "").strip()
+            if not child_sid or not parent_sid:
+                stats["skipped"] += 1
+                continue
+            src_id = summary_map.get(parent_sid)
+            dst_id = summary_map.get(child_sid)
+            if not src_id or not dst_id:
+                stats["skipped"] += 1
+                continue
+            batch.append((src_id, dst_id, EdgeType.DERIVED_FROM, 1.0))
+            stats["derived_from"] += 1
+            if len(batch) >= 2000:
+                flush_batch()
 
+        # summary_messages: (summary_id, message_id) — SUMMARIZES
         for row in lcm.execute("SELECT summary_id, message_id FROM summary_messages"):
-            if row["summary_id"] and row["message_id"]:
-                try:
-                    self.db.add_edge(
-                        f"sn_{row['summary_id']}", f"msg_{row['message_id']}",
-                        EdgeType.SUMMARIZES,
-                    )
-                    stats["summarizes"] += 1
-                except Exception:
-                    stats["skipped"] += 1
+            sid = str(row["summary_id"] or "").strip()
+            mid = str(row["message_id"] or "").strip()
+            if not sid or not mid:
+                stats["skipped"] += 1
+                continue
+            src_id = summary_map.get(sid)
+            dst_id = message_map.get(mid)
+            if not src_id or not dst_id:
+                stats["skipped"] += 1
+                continue
+            batch.append((src_id, dst_id, EdgeType.SUMMARIZES, 1.0))
+            stats["summarizes"] += 1
+            if len(batch) >= 2000:
+                flush_batch()
+
+        flush_batch()
 
         lcm.close()
         return stats
