@@ -377,6 +377,52 @@ def _get_daily_log_content(gdb_conn, branch_id, max_entries, max_chars):
         for r in rows
     ]
 
+
+def _rank_collapsing_sidecar(gc, q_emb, top_n=5, retrieval_mode="balanced"):
+    try:
+        import numpy as np
+    except Exception:
+        return []
+
+    safe_n = max(0, int(top_n or 0))
+    if safe_n <= 0:
+        return []
+
+    collapsing = []
+    for s in gc.db.all_branches():
+        state_val = str(getattr(getattr(s, "state", None), "value", getattr(s, "state", "")) or "")
+        if state_val != "COLLAPSING":
+            continue
+        if int(getattr(s, "node_count", 0) or 0) <= 0:
+            continue
+        mean_vec = getattr(s, "mean_vec", None) or []
+        if not mean_vec:
+            continue
+        collapsing.append(s)
+
+    if not collapsing:
+        return []
+
+    q = np.array(q_emb, dtype=np.float32)
+    ranked = gc.ranker.rank(q, collapsing, retrieval_mode=retrieval_mode)
+    by_id = {s.branch_id: s for s in collapsing}
+    out = []
+    for r in ranked[:safe_n]:
+        s = by_id.get(r.branch_id)
+        out.append({
+            "branch_id": r.branch_id,
+            "total_score": round(r.total_score, 4),
+            "sem_score": round(r.sem_score, 4),
+            "trust_score": round(r.trust_score, 4),
+            "nodes": int(getattr(s, "node_count", 0) or 0) if s else 0,
+            "coherence": round(float(getattr(s, "coherence", 0.0) or 0.0), 4) if s else 0.0,
+            "eff_rank": round(float(getattr(s, "eff_rank", 0.0) or 0.0), 2) if s else 0.0,
+            "state": str(getattr(getattr(s, "state", None), "value", getattr(s, "state", "unknown")) or "unknown"),
+            "regime": str(getattr(getattr(s, "regime", None), "value", getattr(s, "regime", "unknown")) or "unknown"),
+            "note": "excluded_from_primary_rank",
+        })
+    return out
+
 #  Hybrid search 
 def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
     gc = get_gc()
@@ -400,6 +446,12 @@ def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
             'state': b.state.value if b and b.state else 'unknown',
             'regime': b.regime.value if b and b.regime else 'unknown',
         })
+    collapsing_sidecar = _rank_collapsing_sidecar(
+        gc,
+        q_emb,
+        top_n=top_n,
+        retrieval_mode=retrieval_mode,
+    )
 
     # LCM keyword search
     keywords = [w.strip() for w in query.split() if len(w.strip()) >= 3]
@@ -535,6 +587,10 @@ def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
         'retrieval_mode': retrieval_mode,
         'recommendation': recommendation,
         'geometry': {'results': geo_results},
+        'collapsing_sidecar': {
+            'note': 'COLLAPSING branches are excluded from primary geometry ranking; shown as fallback only.',
+            'results': collapsing_sidecar,
+        },
         'lcm': {'conversations': lcm_results, 'keywords': keywords},
         'daily_logs': {
             'keyword_results': daily_keyword,
@@ -1094,6 +1150,17 @@ async def call_tool(name, arguments):
             lines.append(" GEOMETRY DB (semantic similarity):")
             for i, r in enumerate(result['geometry']['results'], 1):
                 lines.append(f"  {i}. {r['branch_id']} | sem={r['sem_score']} | trust={r['trust_score']} | nodes={r['nodes']} | eff_rank={r['eff_rank']} | {r['state']}/{r['regime']}")
+            lines.append("")
+            lines.append(" COLLAPSING SIDECAR (excluded from primary geometry ranking):")
+            sidecar_rows = result.get("collapsing_sidecar", {}).get("results", [])
+            if sidecar_rows:
+                for i, r in enumerate(sidecar_rows, 1):
+                    lines.append(
+                        f"  {i}. {r['branch_id']} | sem={r['sem_score']} | trust={r['trust_score']} "
+                        f"| nodes={r['nodes']} | eff_rank={r['eff_rank']} | {r['state']}/{r['regime']}"
+                    )
+            else:
+                lines.append("  (no collapsing candidates)")
             lines.append("")
             lines.append(" LCM (keyword matches):")
             for i, c in enumerate(result['lcm']['conversations'], 1):

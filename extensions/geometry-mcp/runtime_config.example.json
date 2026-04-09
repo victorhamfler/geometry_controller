@@ -95,7 +95,8 @@
           "anisotropy": 0.05,
           "comp_loss": 0.05,
           "ret_error": 0.05,
-          "contradiction": 0.05
+          "contradiction": 0.05,
+          "topic_drift": 0.05
         },
         "merge_policy": {
           "threshold": 1.2
@@ -107,7 +108,8 @@
         },
         "retrieval_kappa": {
           "contradiction": -0.4,
-          "ret_error": -0.35
+          "ret_error": -0.35,
+          "topic_drift": -0.4
         },
         "merge_policy": {
           "threshold": 1.0
@@ -123,7 +125,8 @@
           "comp_loss": -0.12,
           "contradiction": -0.18,
           "ret_error": -0.2,
-          "hist": 0.22
+          "hist": 0.22,
+          "topic_drift": -0.18
         },
         "split_policy": {
           "threshold": 0.085,
@@ -147,7 +150,8 @@
           "comp_loss": -0.1,
           "contradiction": -0.24,
           "ret_error": -0.28,
-          "hist": 0.18
+          "hist": 0.18,
+          "topic_drift": -0.24
         },
         "split_policy": {
           "threshold": 0.095,
@@ -198,6 +202,33 @@
     "dormant_min_nodes": 8,
     "split_child_copy_usefulness": true,
     "split_child_copy_retrieval_error": true,
-    "split_child_anchor_from_centroid": true
+    "split_child_anchor_from_centroid": true,
+    "contradiction_sim_threshold": 0.0,
+    "contradiction_allowed_roles": [
+      "assistant",
+      "user"
+    ],
+    "contradiction_min_token_count": 8,
+    "contradiction_max_temporal_gap": 0,
+    "contradiction_edge_max_pairs": 256,
+    "topic_drift_enabled": true,
+    "topic_drift_sim_threshold": 0.0,
+    "topic_drift_edge_max_pairs": 256,
+    "topic_drift_sample_min_nodes": 64,
+    "topic_drift_sample_max_nodes": 192,
+    "topic_drift_allowed_roles": [
+      "assistant",
+      "user"
+    ],
+    "topic_drift_min_token_count": 8,
+    "topic_drift_min_temporal_gap": 48,
+    "topic_drift_max_temporal_gap": 0,
+    "topic_drift_bidirectional_edges": false,
+    "protected_attach_topic_drift_threshold": 0.2,
+    "protected_merge_topic_drift_threshold": 0.2,
+    "reactivation_max_topic_drift": 0.35,
+    "lcm_db_path": "<openclaw_home>/lcm.db",
+    "topic_drift_min_content_chars": 30,
+    "topic_drift_require_content_nonempty": true
   }
 }

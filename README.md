@@ -1,4 +1,4 @@
-﻿# LCM Geometry Controller + MCP Server
+# LCM Geometry Controller + MCP Server
 
 Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geometry-aware tools.
 
@@ -12,9 +12,14 @@ Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geomet
 - Added merge execution pipeline (safe mode):
   - `execute_pending_merges(...)` wired into maintenance
   - `merge_execution_mode="soft"` creates `SAME_TOPIC` affinity edges and drains merge queue
-- Added bounded contradiction compute for large branches:
-  - deterministic temporal stratified sampling before cosine matrix
-  - controlled by `contradiction_sample_min_nodes` / `contradiction_sample_max_nodes`
+- Reworked contradiction signal into **Topic Drift / Subtopic Diversity** semantics:
+  - detector now measures temporally distant low-similarity pairs inside a branch
+  - empty/blank content is filtered using LCM message text length
+  - trust polarity fixed: higher drift reduces retrieval trust
+  - split polarity fixed: higher drift increases split pressure
+  - merge polarity fixed: higher drift penalizes merge score
+  - controlled by topic_drift_* keys (legacy contradiction_* keys still supported)
+  - Step 2 physical rename complete: primary storage is topic_drift_density, drift edges use topic_drift, and contradiction_density remains a compatibility mirror
 - Added real dormancy policy:
   - inactivity + low-usefulness -> `DORMANT`
   - activity-based wake path `DORMANT -> REACTIVATING -> ACTIVE`
@@ -54,10 +59,10 @@ Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geomet
 - Added safe schema migration for lifecycle persistence:
   - auto-adds `reactivation_score` column on existing DBs when missing
 - Added protected-memory hard gates:
-  - protected branch types can force `fork` on high conflict/contradiction
+  - protected branch types can force `fork` on high conflict/topic-drift
   - protected merges can be blocked by policy
 - Added safe reactivation guard:
-  - `DORMANT -> REACTIVATING` now checks contradiction/error/similarity gates
+  - `DORMANT -> REACTIVATING` now checks topic-drift/error/similarity gates
 - Added regime-aware retrieval routing:
   - retrieval modes `balanced` / `factual` / `exploratory`
   - mode profiles weight branch `state` + `regime` during ranking
@@ -206,12 +211,12 @@ Useful keys in `geometry_config`:
 - Protected memory + safe reactivation:
   - `protected_branch_types`
   - `protected_attach_conflict_threshold`
-  - `protected_attach_contradiction_threshold`
+  - `protected_attach_topic_drift_threshold`
   - `protected_merge_block`
-  - `protected_merge_contradiction_threshold`
+  - `protected_merge_topic_drift_threshold`
   - `reactivation_min_score`
   - `reactivation_guard_enabled`
-  - `reactivation_max_contradiction`
+  - `reactivation_max_topic_drift`
   - `reactivation_max_retrieval_error`
   - `reactivation_min_similarity`
 - Update-mode metadata classification:
@@ -224,9 +229,17 @@ Useful keys in `geometry_config`:
   - `merge_execution_mode` (`soft` or `off`)
   - `merge_max_jobs_per_cycle`
   - `merge_soft_edge_weight`
-- Contradiction bounded compute:
-  - `contradiction_sample_min_nodes`
-  - `contradiction_sample_max_nodes`
+- Topic drift bounded compute:
+  - `topic_drift_sim_threshold`
+  - `topic_drift_min_temporal_gap`
+  - `topic_drift_max_temporal_gap`
+  - `topic_drift_allowed_roles`
+  - `topic_drift_min_token_count`
+  - `topic_drift_min_content_chars`
+  - `topic_drift_require_content_nonempty`
+  - `topic_drift_sample_min_nodes`
+  - `topic_drift_sample_max_nodes`
+  - `topic_drift_edge_max_pairs`
 - Dormancy policy:
   - `dormant_after_days`
   - `dormant_usefulness_max`

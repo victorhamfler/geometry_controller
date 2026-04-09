@@ -76,6 +76,7 @@ class EdgeType(str, Enum):
     DERIVED_FROM     = "derived_from"
     TEMPORAL_NEXT    = "temporal_next"
     SEMANTIC_NEIGHBOR = "semantic_neighbor"
+    TOPIC_DRIFT      = "topic_drift"
     CONTRADICTS      = "contradicts"
     REFINES          = "refines"
     SUPERSEDES       = "supersedes"
@@ -94,6 +95,7 @@ class GeometryConfig:
 
     # ── Embedding ─────────────────────────────────────────────────────────
     embedding_dim: int = 384
+    lcm_db_path: str = ""
 
     # ── Branch geometry ────────────────────────────────────────────────────
     min_branch_size: int = 8
@@ -120,7 +122,8 @@ class GeometryConfig:
     kappa_coherence:     float = 0.30
     kappa_hist:          float = 0.20
     kappa_comp_loss:     float = 0.20
-    kappa_contradiction: float = 0.25
+    kappa_contradiction: float = -0.25
+    kappa_topic_drift: float = -0.25
     kappa_ret_error:     float = 0.25
     retrieval_prefilter_limit: int = 256
     retrieval_result_limit: int = 128
@@ -159,11 +162,13 @@ class GeometryConfig:
     zeta_anisotropy:  float = 0.20
     zeta_comp_loss:   float = 0.20
     zeta_contradiction: float = 0.25
+    zeta_topic_drift: float = 0.25
     zeta_incoherence: float = 0.15
     zeta_ret_error:   float = 0.20
     eta_topic:        float = 0.20
     eta_co_use:       float = 0.15
-    eta_contradiction: float = 0.20
+    eta_contradiction: float = -0.20
+    eta_topic_drift: float = -0.20
     eta_cos:          float = 0.15
     eta_drift:        float = 0.15
     eta_mu:           float = 0.10
@@ -199,10 +204,26 @@ class GeometryConfig:
 
     # ── Usefulness tracker ─────────────────────────────────────────────────
     usefulness_lambda: float = 0.10
+    topic_drift_enabled: bool = True
+    topic_drift_sim_threshold: float = 0.00
+    topic_drift_edge_max_pairs: int = 256
+    topic_drift_sample_min_nodes: int = 64
+    topic_drift_sample_max_nodes: int = 192  # 0 disables sampling cap
+    topic_drift_allowed_roles: list[str] = field(default_factory=lambda: ["assistant", "user"])
+    topic_drift_min_token_count: int = 8
+    topic_drift_min_content_chars: int = 30
+    topic_drift_require_content_nonempty: bool = True
+    topic_drift_min_temporal_gap: int = 48
+    topic_drift_max_temporal_gap: int = 0
+    topic_drift_bidirectional_edges: bool = False
     contradiction_sim_threshold: float = -0.30
     contradiction_edge_max_pairs: int = 256
     contradiction_sample_min_nodes: int = 64
     contradiction_sample_max_nodes: int = 192  # 0 disables sampling cap
+    contradiction_allowed_roles: list[str] = field(default_factory=lambda: ["assistant", "user"])
+    contradiction_min_token_count: int = 8
+    contradiction_max_temporal_gap: int = 0
+    contradiction_bidirectional_edges: bool = False
     merge_signal_lookback: int = 5000
     dormant_after_days: float = 14.0
     dormant_usefulness_max: float = 0.20
@@ -218,13 +239,16 @@ class GeometryConfig:
     ])
     protected_attach_conflict_threshold: float = 0.35
     protected_attach_contradiction_threshold: float = 0.20
+    protected_attach_topic_drift_threshold: float = 0.20
     protected_merge_block: bool = True
     protected_merge_contradiction_threshold: float = 0.20
+    protected_merge_topic_drift_threshold: float = 0.20
 
     # ── Safe reactivation policy ────────────────────────────────────────────
     reactivation_min_score: float = 0.60
     reactivation_guard_enabled: bool = True
     reactivation_max_contradiction: float = 0.35
+    reactivation_max_topic_drift: float = 0.35
     reactivation_max_retrieval_error: float = 0.60
     reactivation_min_similarity: float = 0.15
 
@@ -281,6 +305,14 @@ class BranchStats:
     merge_counter:       int = 0
 
     last_update_ts:      float = field(default_factory=time.time)
+
+    @property
+    def topic_drift_density(self) -> float:
+        return float(self.contradiction_density)
+
+    @topic_drift_density.setter
+    def topic_drift_density(self, value: float) -> None:
+        self.contradiction_density = float(value)
 
 
 @dataclass
@@ -447,6 +479,7 @@ CREATE TABLE IF NOT EXISTS branch_states (
     coherence            REAL DEFAULT 0.0,
     compression_loss     REAL DEFAULT 0.0,
     node_count           INTEGER DEFAULT 0,
+    topic_drift_density   REAL DEFAULT 0.0,
     contradiction_density REAL DEFAULT 0.0,
     retrieval_error      REAL DEFAULT 0.0,
     usefulness           REAL DEFAULT 0.0,
@@ -890,11 +923,11 @@ class MergeScorer:
         w_eta_cos = _avg("merge_eta", "cos", c.eta_cos, aliases=["eta_cos"])
         w_eta_topic = _avg("merge_eta", "topic", c.eta_topic, aliases=["eta_topic"])
         w_eta_co_use = _avg("merge_eta", "co_use", c.eta_co_use, aliases=["co_use", "eta_co_use"])
-        w_eta_contradiction = _avg(
+        w_eta_topic_drift = _avg(
             "merge_eta",
-            "contradiction",
-            c.eta_contradiction,
-            aliases=["eta_contradiction"],
+            "topic_drift",
+            getattr(c, "eta_topic_drift", c.eta_contradiction),
+            aliases=["contradiction", "eta_contradiction", "eta_topic_drift"],
         )
         w_eta_drift = _avg("merge_eta", "drift", c.eta_drift, aliases=["eta_drift"])
 
@@ -904,7 +937,7 @@ class MergeScorer:
             w_eta_cos          * cos
             + w_eta_topic      * topic_overlap
             + w_eta_co_use     * retrieval_co_use
-            + w_eta_contradiction * ((s1.contradiction_density + s2.contradiction_density) / 2)
+            - abs(w_eta_topic_drift) * ((s1.contradiction_density + s2.contradiction_density) / 2)
             + w_eta_drift      * drift_mismatch
         )
         return float(score)
@@ -956,19 +989,19 @@ class SplitScorer:
             c.zeta_ret_error,
             aliases=["retrieval_error", "zeta_ret_error"],
         )
-        w_contra = _profile_weight(
+        w_topic_drift = _profile_weight(
             p,
             "split_zeta",
-            "contradiction",
-            c.zeta_contradiction,
-            aliases=["zeta_contradiction"],
+            "topic_drift",
+            getattr(c, "zeta_topic_drift", c.zeta_contradiction),
+            aliases=["contradiction", "zeta_contradiction", "zeta_topic_drift"],
         )
         return float(
             w_incoh   * (1.0 - s.coherence)
             + w_aniso  * s.anisotropy
             + w_comp   * s.compression_loss
             + w_ret   * s.retrieval_error
-            + w_contra * s.contradiction_density
+            + abs(w_topic_drift) * s.contradiction_density
         )
 
     def should_split(self, s: BranchStats, score: float, cfg: GeometryConfig) -> bool:
@@ -1058,12 +1091,12 @@ class RetrievalRanker:
                 c.kappa_comp_loss,
                 aliases=["compression_loss", "kappa_comp_loss"],
             )
-            w_kappa_contra = _profile_weight(
+            w_kappa_topic_drift = _profile_weight(
                 p,
                 "retrieval_kappa",
-                "contradiction",
-                c.kappa_contradiction,
-                aliases=["kappa_contradiction"],
+                "topic_drift",
+                getattr(c, "kappa_topic_drift", c.kappa_contradiction),
+                aliases=["contradiction", "kappa_contradiction", "kappa_topic_drift"],
             )
             w_kappa_ret = _profile_weight(
                 p,
@@ -1084,7 +1117,7 @@ class RetrievalRanker:
             trust = (
                 w_kappa_coh     * s.coherence
                 + w_kappa_comp   * s.compression_loss
-                + w_kappa_contra * s.contradiction_density
+                - abs(w_kappa_topic_drift) * s.contradiction_density
                 + w_kappa_ret   * s.retrieval_error
             )
             hist  = (historical_use or {}).get(s.branch_id, 0.0)
@@ -1206,6 +1239,20 @@ class GeometryDB:
             self._conn.execute(
                 "ALTER TABLE branch_states ADD COLUMN reactivation_score REAL DEFAULT 0.0"
             )
+        if "topic_drift_density" not in branch_cols:
+            self._conn.execute(
+                "ALTER TABLE branch_states ADD COLUMN topic_drift_density REAL DEFAULT 0.0"
+            )
+        # Backfill topic_drift_density from legacy contradiction_density when possible.
+        if "contradiction_density" in branch_cols:
+            self._conn.execute(
+                """
+                UPDATE branch_states
+                SET topic_drift_density = COALESCE(contradiction_density, 0.0)
+                WHERE topic_drift_density IS NULL
+                   OR ABS(COALESCE(topic_drift_density, 0.0)) < 1e-12
+                """
+            )
         node_cols = {
             str(r["name"])
             for r in self._conn.execute("PRAGMA table_info(memory_nodes)").fetchall()
@@ -1249,7 +1296,7 @@ class GeometryDB:
                  mean_vec, anchor, cov_diagonal,
                  eff_rank, trace, anisotropy, anchor_drift,
                  coherence, compression_loss,
-                 node_count, contradiction_density,
+                 node_count, topic_drift_density, contradiction_density,
                  retrieval_error, usefulness, reactivation_score,
                  split_counter, merge_counter, last_update_ts)
             VALUES
@@ -1257,7 +1304,7 @@ class GeometryDB:
                  :mean_vec, :anchor, :cov_diagonal,
                  :eff_rank, :trace, :anisotropy, :anchor_drift,
                  :coherence, :compression_loss,
-                 :node_count, :contradiction_density,
+                 :node_count, :contradiction_density, :contradiction_density,
                  :retrieval_error, :usefulness, :reactivation_score,
                  :split_counter, :merge_counter, :last_update_ts)
         """, d)
@@ -1278,6 +1325,7 @@ class GeometryDB:
                 coherence=?,
                 compression_loss=?,
                 node_count=?,
+                topic_drift_density=?,
                 contradiction_density=?,
                 retrieval_error=?,
                 usefulness=?,
@@ -1298,6 +1346,7 @@ class GeometryDB:
                 float(s.coherence),
                 float(s.compression_loss),
                 int(s.node_count),
+                float(s.contradiction_density),
                 float(s.contradiction_density),
                 float(s.retrieval_error),
                 float(s.usefulness),
@@ -1323,6 +1372,13 @@ class GeometryDB:
         for f in ("mean_vec", "anchor", "cov_diagonal"):
             raw = d[f]
             d[f] = json.loads(raw.decode()) if raw else []
+        if "topic_drift_density" in d:
+            d["contradiction_density"] = float(
+                d.get("topic_drift_density")
+                if d.get("topic_drift_density") is not None
+                else d.get("contradiction_density") or 0.0
+            )
+            d.pop("topic_drift_density", None)
         d["state"]  = BranchState(d["state"])
         d["regime"] = GeometricRegime(d["regime"])
         return BranchStats(**d)
@@ -1341,7 +1397,8 @@ class GeometryDB:
             "SELECT "
             "branch_id, branch_type, state, regime, "
             "eff_rank, trace, anisotropy, anchor_drift, "
-            "coherence, compression_loss, node_count, contradiction_density, "
+            "coherence, compression_loss, node_count, "
+            "COALESCE(topic_drift_density, contradiction_density, 0.0) AS topic_drift_density, "
             "retrieval_error, usefulness, reactivation_score, "
             "split_counter, merge_counter, last_update_ts, "
             "CASE WHEN mean_vec IS NOT NULL AND length(mean_vec) > 2 THEN 1 ELSE 0 END AS has_mean "
@@ -1804,6 +1861,21 @@ class GeometryDB:
         self.conn.commit()
         return int(cur.rowcount or 0)
 
+    def remove_edges_touching_nodes(self, node_ids: list[str], edge_type: Optional[EdgeType] = None) -> int:
+        if not node_ids:
+            return 0
+        ph = ",".join(["?"] * len(node_ids))
+        params: list[Any] = []
+        q = f"DELETE FROM memory_edges WHERE (src_id IN ({ph}) OR dst_id IN ({ph}))"
+        params.extend(node_ids)
+        params.extend(node_ids)
+        if edge_type is not None:
+            q += " AND edge_type=?"
+            params.append(edge_type.value)
+        cur = self.conn.execute(q, tuple(params))
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
     def edge_counts_between_sets(self, a_ids: set[str], b_ids: set[str]) -> dict[str, int]:
         if not a_ids or not b_ids:
             return {}
@@ -2097,6 +2169,8 @@ class GeometryController:
         self.embedding_provider = embedding_provider  # may be None
         self.db.connect()
         self._poll_lock        = threading.Lock()
+        self._topic_drift_content_len_cache: dict[str, int] = {}
+        self._topic_drift_content_lookup_failed: bool = False
 
     def _branch_stats_from_scalar_row(self, row: dict[str, Any]) -> BranchStats:
         try:
@@ -2122,7 +2196,11 @@ class GeometryController:
             coherence=float(row.get("coherence") or 0.0),
             compression_loss=float(row.get("compression_loss") or 0.0),
             node_count=int(row.get("node_count") or 0),
-            contradiction_density=float(row.get("contradiction_density") or 0.0),
+            contradiction_density=float(
+                row.get("topic_drift_density")
+                if row.get("topic_drift_density") is not None
+                else row.get("contradiction_density") or 0.0
+            ),
             retrieval_error=float(row.get("retrieval_error") or 0.0),
             usefulness=float(row.get("usefulness") or 0.0),
             reactivation_score=float(row.get("reactivation_score") or 0.0),
@@ -2381,7 +2459,11 @@ class GeometryController:
                     mean_vec=mean_vec,
                     coherence=float(row.get("coherence") or 0.0),
                     compression_loss=float(row.get("compression_loss") or 0.0),
-                    contradiction_density=float(row.get("contradiction_density") or 0.0),
+                    contradiction_density=float(
+                        row.get("topic_drift_density")
+                        if row.get("topic_drift_density") is not None
+                        else row.get("contradiction_density") or 0.0
+                    ),
                     retrieval_error=float(row.get("retrieval_error") or 0.0),
                     usefulness=float(row.get("usefulness") or 0.0),
                     node_count=int(row.get("node_count") or 0),
@@ -2912,8 +2994,15 @@ class GeometryController:
             return False, ""
         if float(conflict_score) >= float(self.cfg.protected_attach_conflict_threshold):
             return True, "protected_conflict"
-        if float(s.contradiction_density) >= float(self.cfg.protected_attach_contradiction_threshold):
-            return True, "protected_contradiction"
+        drift_th = float(
+            getattr(
+                self.cfg,
+                "protected_attach_topic_drift_threshold",
+                self.cfg.protected_attach_contradiction_threshold,
+            )
+        )
+        if float(s.contradiction_density) >= drift_th:
+            return True, "protected_topic_drift"
         return False, ""
 
     def _protected_merge_blocked(self, s1: BranchStats, s2: BranchStats) -> tuple[bool, str]:
@@ -2922,9 +3011,15 @@ class GeometryController:
             return False, ""
         if bool(self.cfg.protected_merge_block):
             return True, "protected_merge_block"
-        th = float(self.cfg.protected_merge_contradiction_threshold)
+        th = float(
+            getattr(
+                self.cfg,
+                "protected_merge_topic_drift_threshold",
+                self.cfg.protected_merge_contradiction_threshold,
+            )
+        )
         if float(s1.contradiction_density) >= th or float(s2.contradiction_density) >= th:
-            return True, "protected_merge_contradiction"
+            return True, "protected_merge_topic_drift"
         return False, ""
 
     def _reactivation_guard_ok(
@@ -2934,7 +3029,14 @@ class GeometryController:
     ) -> bool:
         if not bool(getattr(self.cfg, "reactivation_guard_enabled", True)):
             return True
-        if float(s.contradiction_density) > float(self.cfg.reactivation_max_contradiction):
+        max_topic_drift = float(
+            getattr(
+                self.cfg,
+                "reactivation_max_topic_drift",
+                self.cfg.reactivation_max_contradiction,
+            )
+        )
+        if float(s.contradiction_density) > max_topic_drift:
             return False
         if float(s.retrieval_error) > float(self.cfg.reactivation_max_retrieval_error):
             return False
@@ -3188,10 +3290,169 @@ class GeometryController:
             i += 1
         return sorted(uniq[:k])
 
+    def _resolved_topic_drift_enabled(self) -> bool:
+        raw = getattr(self.cfg, "topic_drift_enabled", True)
+        try:
+            return bool(raw)
+        except Exception:
+            return True
+
+    def _resolved_topic_drift_edge_cap(self) -> int:
+        """
+        Resolve topic-drift edge cap from runtime config safely.
+
+        Backward compatibility:
+        - `topic_drift_edge_max_pairs` preferred.
+        - falls back to `contradiction_edge_max_pairs`.
+        """
+        default_cap = int(
+            getattr(
+                GeometryConfig.__dataclass_fields__.get("topic_drift_edge_max_pairs"),
+                "default",
+                256,
+            )
+            or 256
+        )
+        raw = getattr(self.cfg, "topic_drift_edge_max_pairs", None)
+        if raw is None:
+            raw = getattr(self.cfg, "contradiction_edge_max_pairs", None)
+        if raw is None:
+            return max(0, default_cap)
+        try:
+            return max(0, int(raw))
+        except Exception:
+            return max(0, default_cap)
+
+    def _resolved_topic_drift_sampling_limits(self) -> tuple[int, int]:
+        min_raw = getattr(self.cfg, "topic_drift_sample_min_nodes", None)
+        if min_raw is None:
+            min_raw = getattr(self.cfg, "contradiction_sample_min_nodes", 64)
+        max_raw = getattr(self.cfg, "topic_drift_sample_max_nodes", None)
+        if max_raw is None:
+            max_raw = getattr(self.cfg, "contradiction_sample_max_nodes", 192)
+        return max(2, int(min_raw or 0)), max(0, int(max_raw or 0))
+
+    def _resolved_topic_drift_sim_threshold(self) -> float:
+        raw = getattr(self.cfg, "topic_drift_sim_threshold", None)
+        if raw is None:
+            raw = getattr(self.cfg, "contradiction_sim_threshold", 0.50)
+        return float(raw)
+
+    def _resolved_topic_drift_roles(self) -> set[str]:
+        raw = getattr(self.cfg, "topic_drift_allowed_roles", None)
+        if raw is None:
+            raw = getattr(self.cfg, "contradiction_allowed_roles", None)
+        if raw is None:
+            raw = ["assistant", "user"]
+        allowed = {str(x).strip().lower() for x in raw if str(x).strip()}
+        if not allowed:
+            allowed = {"assistant", "user"}
+        return allowed
+
+    def _resolved_topic_drift_min_tokens(self) -> int:
+        raw = getattr(self.cfg, "topic_drift_min_token_count", None)
+        if raw is None:
+            raw = getattr(self.cfg, "contradiction_min_token_count", 0)
+        return max(0, int(raw or 0))
+
+    def _resolved_topic_drift_temporal_gaps(self) -> tuple[int, int]:
+        min_gap = getattr(self.cfg, "topic_drift_min_temporal_gap", None)
+        if min_gap is None:
+            min_gap = 0
+        max_gap = getattr(self.cfg, "topic_drift_max_temporal_gap", None)
+        if max_gap is None:
+            max_gap = getattr(self.cfg, "contradiction_max_temporal_gap", 0)
+        return max(0, int(min_gap or 0)), max(0, int(max_gap or 0))
+
+    def _resolved_topic_drift_bidirectional(self) -> bool:
+        raw = getattr(self.cfg, "topic_drift_bidirectional_edges", None)
+        if raw is None:
+            raw = getattr(self.cfg, "contradiction_bidirectional_edges", False)
+        return bool(raw)
+
+    def _resolved_topic_drift_min_content_chars(self) -> int:
+        raw = getattr(self.cfg, "topic_drift_min_content_chars", None)
+        if raw is None:
+            raw = 0
+        return max(0, int(raw or 0))
+
+    def _resolved_topic_drift_require_content_nonempty(self) -> bool:
+        raw = getattr(self.cfg, "topic_drift_require_content_nonempty", True)
+        try:
+            return bool(raw)
+        except Exception:
+            return True
+
+    def _resolved_lcm_db_path(self) -> str:
+        raw = str(getattr(self.cfg, "lcm_db_path", "") or "").strip()
+        if raw and os.path.isfile(raw):
+            return raw
+        candidate = os.path.join(os.path.dirname(self.db.db_path) or ".", "lcm.db")
+        if os.path.isfile(candidate):
+            return candidate
+        return ""
+
+    def _topic_drift_content_lengths(self, lcm_ids: list[str]) -> dict[str, int]:
+        ids = [str(x).strip() for x in lcm_ids if str(x or "").strip()]
+        if not ids:
+            return {}
+        if self._topic_drift_content_lookup_failed:
+            return {mid: int(self._topic_drift_content_len_cache.get(mid, -1)) for mid in ids}
+
+        unique_ids = sorted(set(ids))
+        missing = [mid for mid in unique_ids if mid not in self._topic_drift_content_len_cache]
+        if missing:
+            lcm_path = self._resolved_lcm_db_path()
+            if not lcm_path:
+                self._topic_drift_content_lookup_failed = True
+            else:
+                conn: Optional[sqlite3.Connection] = None
+                try:
+                    conn = sqlite3.connect(lcm_path)
+                    conn.row_factory = sqlite3.Row
+                    chunk_size = 400
+                    for i in range(0, len(missing), chunk_size):
+                        chunk = missing[i : i + chunk_size]
+                        if not chunk:
+                            continue
+                        ph = ",".join(["?"] * len(chunk))
+                        rows = conn.execute(
+                            f"""
+                            SELECT message_id, LENGTH(TRIM(COALESCE(content,''))) AS content_len
+                            FROM messages
+                            WHERE message_id IN ({ph})
+                            """,
+                            tuple(chunk),
+                        ).fetchall()
+                        found: set[str] = set()
+                        for r in rows:
+                            mid = str(r["message_id"] or "").strip()
+                            if not mid:
+                                continue
+                            found.add(mid)
+                            self._topic_drift_content_len_cache[mid] = int(r["content_len"] or 0)
+                        for mid in chunk:
+                            if mid not in found:
+                                self._topic_drift_content_len_cache[mid] = -1
+                except Exception:
+                    self._topic_drift_content_lookup_failed = True
+                finally:
+                    if conn is not None:
+                        conn.close()
+
+        return {mid: int(self._topic_drift_content_len_cache.get(mid, -1)) for mid in ids}
+
+    def _resolved_contradiction_edge_cap(self) -> int:
+        # Legacy name retained for compatibility with older helper calls.
+        return self._resolved_topic_drift_edge_cap()
+
     def _compute_contradiction_signals(self, branch_id: str) -> float:
         rows = self.db.list_branch_nodes(branch_id, include_embeddings=True)
         all_node_ids: list[str] = []
+        all_lcm_ids: list[str] = []
         all_vecs: list[np.ndarray] = []
+        all_roles: list[str] = []
+        all_tokens: list[int] = []
         for row in rows:
             emb = row.get("embedding") or []
             if not emb:
@@ -3203,17 +3464,24 @@ class GeometryController:
             if v.size <= 0:
                 continue
             all_node_ids.append(str(row.get("id")))
+            all_lcm_ids.append(str(row.get("lcm_id") or "").strip())
             all_vecs.append(v)
+            all_roles.append(str(row.get("role") or "").strip().lower())
+            all_tokens.append(int(row.get("token_count") or 0))
 
         if len(all_vecs) < 2:
             if all_node_ids:
-                self.db.remove_edges_for_nodes(all_node_ids, EdgeType.CONTRADICTS)
+                self.db.remove_edges_touching_nodes(all_node_ids, EdgeType.TOPIC_DRIFT)
             return 0.0
 
-        pair_cap = max(1, int(self.cfg.contradiction_edge_max_pairs))
+        if not self._resolved_topic_drift_enabled():
+            self.db.remove_edges_touching_nodes(all_node_ids, EdgeType.TOPIC_DRIFT)
+            return 0.0
+
+        edge_cap = self._resolved_topic_drift_edge_cap()
+        pair_cap = max(1, edge_cap if edge_cap > 0 else 256)
         dynamic_min = max(2, int(math.sqrt(max(2, pair_cap * 2))))
-        configured_min = max(2, int(self.cfg.contradiction_sample_min_nodes))
-        configured_max = int(self.cfg.contradiction_sample_max_nodes)
+        configured_min, configured_max = self._resolved_topic_drift_sampling_limits()
         if configured_max > 0:
             sample_target = min(
                 len(all_vecs),
@@ -3225,10 +3493,16 @@ class GeometryController:
         if len(all_vecs) > sample_target:
             keep_idx = self._temporal_stratified_indices(len(all_vecs), sample_target)
             node_ids = [all_node_ids[i] for i in keep_idx]
+            lcm_ids = [all_lcm_ids[i] for i in keep_idx]
             vecs = [all_vecs[i] for i in keep_idx]
+            roles = [all_roles[i] for i in keep_idx]
+            tokens = [all_tokens[i] for i in keep_idx]
         else:
             node_ids = all_node_ids
+            lcm_ids = all_lcm_ids
             vecs = all_vecs
+            roles = all_roles
+            tokens = all_tokens
 
         embs = np.stack(vecs, axis=0)
         norms = np.linalg.norm(embs, axis=1, keepdims=True)
@@ -3241,27 +3515,74 @@ class GeometryController:
         if pair_total <= 0:
             return 0.0
 
-        th = float(self.cfg.contradiction_sim_threshold)
+        th = self._resolved_topic_drift_sim_threshold()
         sims = sim[triu_i, triu_j]
-        contrad_mask = sims < th
-        contrad_count = int(np.count_nonzero(contrad_mask))
-        density = float(contrad_count / max(1, pair_total))
+        drift_mask = sims < th
 
-        self.db.remove_edges_for_nodes(all_node_ids, EdgeType.CONTRADICTS)
+        # Topic drift gates: focus on sufficiently distant, low-similarity points in branch timeline.
+        allowed_roles = self._resolved_topic_drift_roles()
+        min_tokens = self._resolved_topic_drift_min_tokens()
+        min_chars = self._resolved_topic_drift_min_content_chars()
+        require_content = self._resolved_topic_drift_require_content_nonempty()
+        min_gap, max_gap = self._resolved_topic_drift_temporal_gaps()
+
+        role_arr = np.array(roles, dtype=object)
+        tok_arr = np.array(tokens, dtype=np.int64)
+        role_i = role_arr[triu_i]
+        role_j = role_arr[triu_j]
+        tok_i = tok_arr[triu_i]
+        tok_j = tok_arr[triu_j]
+
+        role_mask = np.array(
+            [
+                (str(a) in allowed_roles) and (str(b) in allowed_roles)
+                for a, b in zip(role_i.tolist(), role_j.tolist())
+            ],
+            dtype=bool,
+        )
+        token_mask = (tok_i >= min_tokens) & (tok_j >= min_tokens)
+        if require_content and min_chars > 0:
+            content_lookup = self._topic_drift_content_lengths(lcm_ids)
+            content_arr = np.array(
+                [int(content_lookup.get(mid, -1)) for mid in lcm_ids],
+                dtype=np.int64,
+            )
+            content_mask = (content_arr[triu_i] >= min_chars) & (content_arr[triu_j] >= min_chars)
+        else:
+            content_mask = np.ones_like(triu_i, dtype=bool)
+        gap_values = triu_j - triu_i
+        if min_gap > 0:
+            min_gap_mask = gap_values >= min_gap
+        else:
+            min_gap_mask = np.ones_like(triu_i, dtype=bool)
+        if max_gap > 0:
+            max_gap_mask = gap_values <= max_gap
+        else:
+            max_gap_mask = np.ones_like(triu_i, dtype=bool)
+        eligible_mask = role_mask & token_mask & content_mask & min_gap_mask & max_gap_mask
+        drift_mask = drift_mask & eligible_mask
+        contrad_count = int(np.count_nonzero(drift_mask))
+        eligible_total = int(np.count_nonzero(eligible_mask))
+        density = float(contrad_count / max(1, eligible_total))
+
+        self.db.remove_edges_touching_nodes(all_node_ids, EdgeType.TOPIC_DRIFT)
         if contrad_count > 0:
-            idx = np.where(contrad_mask)[0]
+            idx = np.where(drift_mask)[0]
             if idx.size > 0:
                 order = idx[np.argsort(sims[idx])]
-                max_pairs = max(0, int(self.cfg.contradiction_edge_max_pairs))
+                max_pairs = edge_cap
                 if max_pairs > 0:
                     order = order[:max_pairs]
                 edges: list[tuple[str, str, EdgeType, float]] = []
+                bidirectional = self._resolved_topic_drift_bidirectional()
                 for pos in order:
                     a = node_ids[int(triu_i[pos])]
                     b = node_ids[int(triu_j[pos])]
-                    w = float(abs(float(sims[pos])))
-                    edges.append((a, b, EdgeType.CONTRADICTS, w))
-                    edges.append((b, a, EdgeType.CONTRADICTS, w))
+                    w = float(max(0.0, min(1.0, 0.5 * (1.0 - float(sims[pos])))))
+                    # Temporal direction: newer node (j) drifts away from older node (i).
+                    edges.append((b, a, EdgeType.TOPIC_DRIFT, w))
+                    if bidirectional:
+                        edges.append((a, b, EdgeType.TOPIC_DRIFT, w))
                 self.db.add_edges_bulk(edges)
 
         return density
@@ -3715,6 +4036,8 @@ class GeometryController:
             "node_count":        s.node_count,
             "usefulness":        round(s.usefulness, 3),
             "contradiction_density": round(s.contradiction_density, 3),
+            "topic_drift_density": round(s.contradiction_density, 3),
+            "subtopic_diversity_density": round(s.contradiction_density, 3),
             "update_mode_counts": self.db.branch_update_mode_counts(branch_id),
             "correction_counts": self.db.branch_correction_counts(branch_id),
             "recent_corrections": self.db.recent_corrections(branch_id, limit=8),

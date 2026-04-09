@@ -163,7 +163,8 @@ print(r['state'], r['regime'], r['eff_rank'], r['coherence'])
 | `coherence` | REAL | Mean pairwise cosine similarity |
 | `trace` | REAL | Sum of variances |
 | `compression_loss` | REAL | Compression error (reconstruction from low-rank) |
-| `contradiction_density` | REAL | Density of contradictory message pairs |
+| `topic_drift_density` | REAL | Primary topic drift / subtopic diversity density signal |
+| `contradiction_density` | REAL | Legacy compatibility mirror of topic drift density |
 | `retrieval_error` | REAL | EMA of retrieval mis-match scores |
 | `usefulness` | REAL | EMA usefulness score from retrieval feedback |
 | `reactivation_score` | REAL | Reactivation signal used for DORMANT -> REACTIVATING transitions |
@@ -198,7 +199,7 @@ print(r['state'], r['regime'], r['eff_rank'], r['coherence'])
 |--------|------|-------------|
 | `src_id` | TEXT | Source node |
 | `dst_id` | TEXT | Target node |
-| `edge_type` | TEXT | EdgeType: DERIVED_FROM, SUMMARIZES, REFINES, CONTRADICTS, SUPERSEDES |
+| `edge_type` | TEXT | EdgeType: DERIVED_FROM, SUMMARIZES, TOPIC_DRIFT, REFINES, CONTRADICTS, SUPERSEDES |
 | `weight` | REAL | Edge weight (default 1.0) |
 
 ### `retrieval_feedback` — Retrieval Feedback Signals
@@ -292,7 +293,7 @@ Rank all branches by relevance to a query embedding.
 **Returns:** list of `RetrievalCandidate` sorted by `total_score` descending:
 - `branch_id`
 - `sem_score` — cosine similarity to branch centroid
-- `trust_score` — composite of coherence, compression_loss, contradiction_density
+- `trust_score` — composite of coherence, compression_loss, topic drift density (penalty), retrieval_error
 - `react_score` — reactivation signal
 - `total_score` — weighted composite: `(α·sem + β·trust + δ·react) * mode_multiplier(state, regime)`
 
@@ -304,7 +305,8 @@ Detailed geometry report for one branch.
 r = gc.branch_report('conv_1')
 # r.keys(): branch_id, state, regime, node_count, eff_rank, anisotropy,
 #           coherence, trace, anchor_drift, compression_loss,
-#           contradiction_density, retrieval_error, update_mode_counts,
+#           contradiction_density (legacy), topic_drift_density, subtopic_diversity_density,
+#           retrieval_error, update_mode_counts,
 #           correction_counts, recent_corrections, mean_vec (truncated)
 ```
 
@@ -315,7 +317,7 @@ Full maintenance sweep over all branches. Should be run periodically (every 20�
 **Operations per branch:**
 1. **Starts scalar-first scan** over `branch_states` and only full-loads branch blobs when needed
 2. **Recomputes geometry** for eligible branches from `memory_nodes` rows
-3. **Refreshes contradiction signals** (density + bounded `CONTRADICTS` edges)
+3. **Refreshes topic drift signals** (density + bounded `TOPIC_DRIFT` edges)
 4. **Reclassifies regime** - PRODUCTIVE / RIGID / UNSTABLE
 5. **Applies dormancy policy** based on real branch activity age + usefulness thresholds
 6. **Scans for splits and prepares ranked candidates** when gate + hysteresis conditions are met
@@ -429,19 +431,28 @@ gc = GeometryController('/path/to/lcm_geometry.db', cfg=cfg)
 | `retrieval_mode_factors` | dict | Regime/state multipliers applied per retrieval mode |
 | `candidate_prefilter_limit` | 128 | Max branches inspected by scalar prefilter for `on_new_item` |
 | `candidate_branch_cap` | 10 | Max full branches loaded for final allocation scoring |
-| `contradiction_sample_min_nodes` | 64 | Minimum sample target for contradiction compute on large branches |
-| `contradiction_sample_max_nodes` | 192 | Sampling cap for contradiction compute (`0` disables cap) |
+| `topic_drift_sim_threshold` | 0.00 | Topic drift gate (`sim < threshold`) on temporally distant pairs |
+| `topic_drift_min_temporal_gap` | 48 | Minimum sequence distance between compared messages |
+| `topic_drift_max_temporal_gap` | 0 | Optional upper sequence distance bound (`0` = no max) |
+| `topic_drift_allowed_roles` | `["assistant","user"]` | Roles eligible for topic drift pairing |
+| `topic_drift_min_token_count` | 8 | Minimum token count per side for eligible pair |
+| `topic_drift_min_content_chars` | 30 | Minimum non-whitespace LCM content chars per side |
+| `topic_drift_require_content_nonempty` | True | Enforces content-based filtering via `lcm.db` |
+| `topic_drift_sample_min_nodes` | 64 | Minimum sample target for topic drift compute on large branches |
+| `topic_drift_sample_max_nodes` | 192 | Sampling cap for topic drift compute (`0` disables cap) |
+| `topic_drift_edge_max_pairs` | 256 | Max persisted topic drift edges per branch recompute |
+| `lcm_db_path` | auto / explicit | Optional path override used for content-length filtering |
 | `dormant_after_days` | 14.0 | Activity age threshold to mark dormant |
 | `dormant_usefulness_max` | 0.20 | Dormancy requires usefulness at/below this value |
 | `dormant_min_nodes` | 8 | Minimum branch size before dormancy policy applies |
 | `protected_branch_types` | list[str] | Protected branch classes for hard attach/merge gates |
 | `protected_attach_conflict_threshold` | 0.35 | Protected attach conflict gate |
-| `protected_attach_contradiction_threshold` | 0.20 | Protected attach contradiction-density gate |
+| `protected_attach_topic_drift_threshold` | 0.20 | Protected attach topic-drift density gate |
 | `protected_merge_block` | True | If true, blocks merge queueing when either branch is protected |
-| `protected_merge_contradiction_threshold` | 0.20 | Alternative contradiction-based protected merge gate |
+| `protected_merge_topic_drift_threshold` | 0.20 | Alternative topic-drift-based protected merge gate |
 | `reactivation_min_score` | 0.60 | Minimum reactivation score before wake transitions |
-| `reactivation_guard_enabled` | True | Enables contradiction/error/similarity checks before wake |
-| `reactivation_max_contradiction` | 0.35 | Wake blocked above this contradiction density |
+| `reactivation_guard_enabled` | True | Enables topic-drift/error/similarity checks before wake |
+| `reactivation_max_topic_drift` | 0.35 | Wake blocked above this topic drift density |
 | `reactivation_max_retrieval_error` | 0.60 | Wake blocked above this retrieval error |
 | `reactivation_min_similarity` | 0.15 | Query-to-branch similarity floor for relevance-triggered wake |
 | `update_mode_refine_similarity_min` | 0.92 | Similarity floor for labeling node updates as `refine` |
@@ -453,6 +464,11 @@ gc = GeometryController('/path/to/lcm_geometry.db', cfg=cfg)
 | `rigid_rank_ratio` | 0.15 | eff_rank below this → RIGID regime |
 | `unstable_coh_floor` | 0.45 | Coherence below this → UNSTABLE |
 | `unstable_comp_ceil` | 0.65 | Compression loss above this → UNSTABLE |
+
+Compatibility notes:
+- Legacy `contradiction_*` runtime keys are still accepted as fallbacks for topic drift settings.
+- Primary stored field is `topic_drift_density`; `contradiction_density` is kept synced as a legacy compatibility mirror.
+- Reports expose `contradiction_density`, `topic_drift_density`, and `subtopic_diversity_density` as equivalent aliases.
 
 ---
 
@@ -507,7 +523,7 @@ total = α·sem + β·trust + δ·react
 
 Where:
 - **`sem`** — cosine similarity of query embedding to branch mean_vec
-- **`trust`** — `κ_coherence·coherence + κ_comp_loss·compression_loss + κ_contradiction·contradiction_density + κ_ret_error·retrieval_error`
+- **`trust`** — `κ_coherence·coherence + κ_comp_loss·compression_loss - |κ_topic_drift|·topic_drift_density + κ_ret_error·retrieval_error`
 - **`react`** — recency/reactivation signal (half semantic + history + project signals)
 
 ### CSD Scoring (On New Message)
@@ -664,7 +680,7 @@ Detailed geometry metrics for one branch.
 geometry-hybrid__branch_report(branch_id="conv_1")
 ```
 
-Returns: state, regime, node_count, eff_rank, anisotropy, coherence, trace, anchor_drift, mean_vec (first 10 dims), compression_loss, contradiction_density, retrieval_error, update/correction summaries.
+Returns: state, regime, node_count, eff_rank, anisotropy, coherence, trace, anchor_drift, mean_vec (first 10 dims), compression_loss, contradiction_density/topic_drift_density/subtopic_diversity_density, retrieval_error, update/correction summaries.
 
 ### `geometry-hybrid__geometry_stats`
 
@@ -763,9 +779,9 @@ The current controller build includes these production features:
 1. **Incremental ingest API** via `poll_lcm_for_new_items(...)` using rowid cursors.
 2. **Parent-aware insertion** in `on_new_item(...)` with `parent_lcm_id` resolution.
 3. **Automatic `TEMPORAL_NEXT` edge creation** between consecutive nodes in the same branch.
-4. **Contradiction refresh** in maintenance:
-   - contradiction density recomputation per branch
-   - bounded `CONTRADICTS` edge regeneration
+4. **Topic drift refresh** in maintenance:
+   - topic drift / subtopic diversity density recomputation per branch
+   - bounded `TOPIC_DRIFT` edge regeneration (legacy `CONTRADICTS` reserved for correction lineage)
 5. **Merge runtime signals** integrated into merge scoring:
    - graph overlap from memory edges
    - retrieval co-use from feedback history
@@ -792,14 +808,14 @@ The current controller build includes these production features:
 11. **Persisted CSD EMA state** (`csd_ema_state`) and retrieval history consistency updates.
 12. **Scalar/lazy loading paths** for retrieval/candidate selection to avoid full-blob scans.
 13. **Soft merge execution** with pending merge queue draining.
-14. **Bounded contradiction compute** via temporal stratified sampling on large branches.
+14. **Bounded topic drift compute** via temporal stratified sampling on large branches.
 15. **Dormancy lifecycle policy** based on real activity age + usefulness.
 16. **Split child priors** (usefulness/retrieval_error inheritance + centroid anchor seeding).
 17. **Branch-type aware allocation thresholds** with global fallback.
 18. **Scalar-first maintenance persistence** to reduce blob I/O.
 19. **Connect-time schema migration** for `reactivation_score`.
 20. **Protected-memory hard gates** for attach/fork and merge queueing.
-21. **Safe reactivation guard** using contradiction/retrieval-error/similarity checks.
+21. **Safe reactivation guard** using topic-drift/retrieval-error/similarity checks.
 22. **Regime-aware retrieval routing** via `balanced`/`factual`/`exploratory` mode multipliers.
 23. **Branch-type metric profiles** for CSD/retrieval/split/merge sensitivity tuning.
 24. **Versioned correction flow** with explicit `REFINES`/`CONTRADICTS`/`SUPERSEDES` lineage metadata.

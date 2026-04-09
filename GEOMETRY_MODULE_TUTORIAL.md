@@ -1,4 +1,4 @@
-﻿# LCM Geometry Module - User and Agent Tutorial
+# LCM Geometry Module - User and Agent Tutorial
 
 **Version:** 1.4
 **Module:** `lcm_geometry_controller.py`
@@ -99,16 +99,19 @@ For `hybrid_search`, use:
 | `merge_signal_lookback` | `5000` | Retrieval co-use lookback rows for merge scoring |
 | `merge_execution_mode` | `"soft"` | Execute pending merge jobs by writing affinity edges and clearing queue |
 | `merge_max_jobs_per_cycle` | `5` | Max merge jobs executed per maintenance cycle |
-| `contradiction_sim_threshold` | `-0.30` | Cosine threshold used to detect contradiction pairs |
-| `contradiction_sample_max_nodes` | `192` | Cap contradiction matrix size for large branches (`0` disables cap) |
+| `topic_drift_sim_threshold` | `0.00` | Cosine threshold for subtopic drift pairs (`sim < threshold`) |
+| `topic_drift_min_temporal_gap` | `48` | Minimum sequence distance between compared messages |
+| `topic_drift_sample_max_nodes` | `192` | Cap topic-drift matrix size for large branches (`0` disables cap) |
+| `topic_drift_min_content_chars` | `30` | Require both paired messages to have at least this many non-whitespace chars |
+| `topic_drift_require_content_nonempty` | `true` | Enforce content-based filtering using `lcm.db` message text |
 | `dormant_after_days` | `14.0` | Inactivity threshold for dormancy |
 | `dormant_usefulness_max` | `0.20` | Branch usefulness must be below this to become dormant |
 | `protected_branch_types` | `["identity","user_fact",...]` | Branch types with hard attach/merge protection |
 | `protected_attach_conflict_threshold` | `0.35` | Conflict gate for protected attach |
-| `protected_attach_contradiction_threshold` | `0.20` | Contradiction-density gate for protected attach |
+| `protected_attach_topic_drift_threshold` | `0.20` | Topic-drift density gate for protected attach |
 | `reactivation_guard_enabled` | `true` | Enable safe reactivation checks |
 | `reactivation_min_score` | `0.60` | Minimum reactivation score before wake |
-| `reactivation_max_contradiction` | `0.35` | Max contradiction allowed for wake |
+| `reactivation_max_topic_drift` | `0.35` | Max topic drift allowed for wake |
 | `reactivation_max_retrieval_error` | `0.60` | Max retrieval error allowed for wake |
 | `reactivation_min_similarity` | `0.15` | Min semantic similarity for relevance-triggered wake |
 | `update_mode_refine_similarity_min` | `0.92` | Similarity floor to classify node insertions as `refine` |
@@ -122,6 +125,10 @@ For `hybrid_search`, use:
 | `polling.cursor_path` *(top-level)* | `<openclaw_home>/.../poll_cursor.json` | Persistent rowid cursor path |
 | `split_child_copy_usefulness` | `true` | Split children inherit parent usefulness |
 | `split_child_anchor_from_centroid` | `true` | Split children seed anchor from cluster centroid |
+
+Compatibility note:
+- `topic_drift_density` is the primary stored field.
+- `contradiction_density` is kept as a synced legacy mirror, and report aliases `topic_drift_density` and `subtopic_diversity_density` resolve to the same signal.
 
 ---
 
