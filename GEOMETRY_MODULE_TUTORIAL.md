@@ -211,6 +211,22 @@ Expected healthy validation:
 
 Use `backup=false` only when you explicitly do not want a pre-sync DB backup.
 
+### 8.1 One-command cleanup + sync
+
+If you want a standard maintenance pass (Lossless doctor-clean + geometry DAG sync/validation):
+
+```bash
+/home/victo/.openclaw/workspace/scripts/lossless_geometry_maintenance.sh --text
+```
+
+Apply cleanup + sync:
+
+```bash
+/home/victo/.openclaw/workspace/scripts/lossless_geometry_maintenance.sh --apply --text
+```
+
+This avoids dependency on root `/lcm` shell command routing and gives deterministic JSON/text outputs for operator logs.
+
 ---
 
 ## 9. Operating tips

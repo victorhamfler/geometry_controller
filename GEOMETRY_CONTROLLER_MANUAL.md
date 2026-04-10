@@ -584,6 +584,32 @@ Or via OpenClaw heartbeat (edit `HEARTBEAT.md`):
   `python3 -c "import sys; sys.path.insert(0, '<module_repo_root>'); from lcm_geometry_controller import GeometryController; gc = GeometryController('<openclaw_home>/lcm_geometry.db'); print(gc.run_maintenance_cycle())"`
 ```
 
+### 9.1 Lossless cleanup + geometry sync wrapper (operations)
+
+For maintenance runs that need Lossless-Claw doctor-clean plus immediate geometry DAG validation, use:
+
+```bash
+/home/victo/.openclaw/workspace/scripts/lossless_geometry_maintenance.sh --text
+```
+
+Apply cleanup (backup is created by Lossless-Claw):
+
+```bash
+/home/victo/.openclaw/workspace/scripts/lossless_geometry_maintenance.sh --apply --text
+```
+
+Single-filter apply:
+
+```bash
+/home/victo/.openclaw/workspace/scripts/lossless_geometry_maintenance.sh --apply --filter null_subagent_context --text
+```
+
+What the wrapper does:
+
+1. Runs Lossless doctor-clean scan/apply via `lossless_doctor_clean_runner.ts`
+2. Rebuilds imported DAG edges from `lcm.db` into `lcm_geometry.db`
+3. Validates orphan counts for `derived_from` and `summarizes`
+
 ---
 
 ## 10. Backfill — One-Time Setup

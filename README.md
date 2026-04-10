@@ -266,6 +266,32 @@ Useful keys in `geometry_config`:
 4. Run `sync_lcm_dag_edges` after major backfill/import refreshes to keep DAG link integrity validated.
 5. Re-run `lcm_geometry_backfill.py` periodically to keep geometry aligned with latest LCM data.
 
+## One-command maintenance (Lossless cleanup + Geometry sync)
+
+Use this wrapper when testing/maintaining Lossless-Claw cleanup together with Geometry DAG integrity:
+
+```bash
+/home/victo/.openclaw/workspace/scripts/lossless_geometry_maintenance.sh --text
+```
+
+Apply cleanup (with backup) + sync:
+
+```bash
+/home/victo/.openclaw/workspace/scripts/lossless_geometry_maintenance.sh --apply --text
+```
+
+Apply only one cleanup filter:
+
+```bash
+/home/victo/.openclaw/workspace/scripts/lossless_geometry_maintenance.sh --apply --filter null_subagent_context --text
+```
+
+Notes:
+
+- Cleanup uses Lossless-Claw internal doctor-clean functions via headless runner (`lossless_doctor_clean_runner.ts`).
+- After cleanup, the wrapper re-imports DAG edges (`derived_from`, `summarizes`) and validates orphan counts.
+- This avoids relying on root CLI `/lcm` command routing.
+
 ## Troubleshooting
 
 - `FileNotFoundError: ... lcm.db`: ensure `<openclaw_home>/lcm.db` exists.
