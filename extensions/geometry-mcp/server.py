@@ -20,6 +20,7 @@ import json
 import time
 import threading
 import shutil
+import uuid
 
 # Resolve workspace/module path  going up from extensions/geometry-mcp/  extensions/  ~/.openclaw/
 SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -426,6 +427,7 @@ def _rank_collapsing_sidecar(gc, q_emb, top_n=5, retrieval_mode="balanced"):
 #  Hybrid search 
 def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
     gc = get_gc()
+    query_id = str(uuid.uuid4())
 
     # Encode query
     q_emb = _embed_query(query)
@@ -433,8 +435,23 @@ def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
     # Geometry ranking
     ranked = gc.rank_retrieval(q_emb, retrieval_mode=retrieval_mode)
     geo_results = []
+    implicit_feedback_logged = 0
     for r in ranked[:top_n]:
         b = gc.db.load_branch(r.branch_id)
+        try:
+            gc.record_retrieval(
+                query_id=query_id,
+                branch_id=str(r.branch_id),
+                score=float(r.total_score),
+                used=False,
+                corrected=False,
+                expanded=False,
+                usefulness_signal=0.5,
+                feedback_source="implicit_hybrid_search",
+            )
+            implicit_feedback_logged += 1
+        except Exception:
+            pass
         geo_results.append({
             'branch_id': r.branch_id,
             'total_score': round(r.total_score, 4),
@@ -583,9 +600,14 @@ def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
         recommendation = "geometry"
 
     return {
+        'query_id': query_id,
         'query': query,
         'retrieval_mode': retrieval_mode,
         'recommendation': recommendation,
+        'feedback': {
+            'implicit_logged': implicit_feedback_logged,
+            'implicit_usefulness_signal': 0.5,
+        },
         'geometry': {'results': geo_results},
         'collapsing_sidecar': {
             'note': 'COLLAPSING branches are excluded from primary geometry ranking; shown as fallback only.',
@@ -656,9 +678,13 @@ def do_geometry_stats():
     regimes = {r['regime']: r['cnt'] for r in conn.execute(
         "SELECT regime, COUNT(*) as cnt FROM branch_states GROUP BY regime").fetchall()}
 
-    r = conn.execute("SELECT AVG(eff_rank) as a, AVG(coherence) as c FROM branch_states").fetchone()
+    r = conn.execute(
+        "SELECT AVG(eff_rank) as a, AVG(coherence) as c, AVG(COALESCE(role_diversity, 0.0)) as rd "
+        "FROM branch_states"
+    ).fetchone()
     avg_rank = round(r['a'], 2) if r['a'] else 0
     avg_coh = round(r['c'], 4) if r['c'] else 0
+    avg_role_div = round(r['rd'], 4) if r['rd'] is not None else 0
 
     conn.close()
     return {
@@ -668,9 +694,18 @@ def do_geometry_stats():
         'regimes': regimes,
         'avg_eff_rank': avg_rank,
         'avg_coherence': avg_coh,
+        'avg_role_diversity': avg_role_div,
         'embedding_model': EMBED_MODEL_NAME,
         'embedding_dim': 384
     }
+
+
+def do_maintenance_cycle(max_branches=None, reset_chunk_cursor=False):
+    gc = get_gc()
+    kwargs = {"reset_chunk_cursor": bool(reset_chunk_cursor)}
+    if max_branches is not None:
+        kwargs["max_branches"] = max(1, int(max_branches))
+    return gc.run_maintenance_cycle(**kwargs)
 
 
 #  Conversation content (geometry  LCM bridge) 
@@ -1037,6 +1072,26 @@ async def list_tools():
             }
         ),
         Tool(
+            name="retrieval_feedback",
+            description=(
+                "Record explicit retrieval feedback for a branch returned by hybrid_search. "
+                "Use query_id from the hybrid_search response."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query_id": {"type": "string", "description": "query_id returned by hybrid_search"},
+                    "branch_id": {"type": "string", "description": "Branch id, e.g. conv_186"},
+                    "score": {"type": "number", "description": "Optional score for this feedback event"},
+                    "used": {"type": "boolean", "description": "Set true when retrieval helped"},
+                    "corrected": {"type": "boolean", "description": "Set true when retrieval was wrong/misleading"},
+                    "expanded": {"type": "boolean", "description": "Set true when branch was expanded/followed-up"},
+                    "usefulness_signal": {"type": "number", "description": "Optional explicit usefulness in [0,1]"},
+                },
+                "required": ["query_id", "branch_id"]
+            }
+        ),
+        Tool(
             name="branch_report",
             description="Get detailed geometry metrics for a specific branch (e.g. 'conv_186' or 'day_2026-04-07').",
             inputSchema={
@@ -1051,6 +1106,26 @@ async def list_tools():
             name="geometry_stats",
             description="Get overall geometry database statistics  branch count, state distribution, average metrics.",
             inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="maintenance_cycle",
+            description=(
+                "Run one geometry maintenance cycle. Supports low-RAM chunking via max_branches "
+                "and optional chunk cursor reset."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "max_branches": {
+                        "type": "integer",
+                        "description": "Optional branch cap for this run. Overrides configured chunk size for one cycle."
+                    },
+                    "reset_chunk_cursor": {
+                        "type": "boolean",
+                        "description": "Reset chunk cursor before running this cycle."
+                    }
+                }
+            }
         ),
         Tool(
             name="sync_lcm_ingest",
@@ -1082,6 +1157,36 @@ async def list_tools():
                         "description": "Create a DB backup before rebuild (default true)."
                     }
                 }
+            }
+        ),
+        Tool(
+            name="backfill_lcm_conversations",
+            description=(
+                "Targeted LCM→geometry backfill for specific conversation IDs. "
+                "Use this to repair zombie conv_* branches without full backfill."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "conversation_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "LCM conversation IDs to backfill (e.g. [57,365,376])."
+                    },
+                    "max_per_conv": {
+                        "type": "integer",
+                        "description": "Max messages per conversation (stratified sample cap). Default 200."
+                    },
+                    "resume": {
+                        "type": "boolean",
+                        "description": "Skip branches already present in branch_states. Default true."
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Only report what would run; do not write nodes."
+                    }
+                },
+                "required": ["conversation_ids"]
             }
         ),
         Tool(
@@ -1141,6 +1246,7 @@ async def call_tool(name, arguments):
 
             lines = [
                 f" Hybrid Search: \"{query}\"",
+                f" Query ID: {result.get('query_id', '-')}",
                 f" Retrieval mode: {result.get('retrieval_mode', 'balanced')}",
                 f" Recommendation: use {result['recommendation'].upper()}",
                 "",
@@ -1180,6 +1286,59 @@ async def call_tool(name, arguments):
                     lines.append(f"   {i}. {r['branch_id']} | kw={r['keyword_matched']} | {r['snippet']}")
             if not sem_rows and not kw_rows:
                 lines.append("  (no daily-log matches)")
+            feedback_meta = result.get("feedback", {}) or {}
+            lines.append("")
+            lines.append(
+                f" Feedback: implicit signals logged={feedback_meta.get('implicit_logged', 0)} "
+                f"(signal={feedback_meta.get('implicit_usefulness_signal', 0.5)})"
+            )
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        elif name == "retrieval_feedback":
+            query_id = str(arguments.get("query_id", "") or "").strip()
+            branch_id = str(arguments.get("branch_id", "") or "").strip()
+            if not query_id or not branch_id:
+                return [TextContent(type="text", text="Error: query_id and branch_id are required")]
+
+            score_raw = arguments.get("score", 0.0)
+            try:
+                score = float(score_raw)
+            except Exception:
+                score = 0.0
+            used = bool(arguments.get("used", False))
+            corrected = bool(arguments.get("corrected", False))
+            expanded = bool(arguments.get("expanded", False))
+            usefulness_raw = arguments.get("usefulness_signal")
+            usefulness_signal = None
+            if usefulness_raw is not None:
+                try:
+                    usefulness_signal = max(0.0, min(1.0, float(usefulness_raw)))
+                except Exception:
+                    usefulness_signal = None
+
+            gc = get_gc()
+            gc.record_retrieval(
+                query_id=query_id,
+                branch_id=branch_id,
+                score=score,
+                used=used,
+                corrected=corrected,
+                expanded=expanded,
+                usefulness_signal=usefulness_signal,
+                feedback_source="explicit_tool_feedback",
+            )
+            lines = [
+                " Retrieval feedback recorded",
+                f"  query_id: {query_id}",
+                f"  branch_id: {branch_id}",
+                f"  score: {round(score, 4)}",
+                f"  used: {used}",
+                f"  corrected: {corrected}",
+                f"  expanded: {expanded}",
+                f"  usefulness_signal: {usefulness_signal if usefulness_signal is not None else '(derived)'}",
+            ]
+            if poll_line:
+                lines.insert(1, poll_line)
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "branch_report":
@@ -1204,9 +1363,44 @@ async def call_tool(name, arguments):
                      f"  Regimes: {stats['regimes']}",
                      f"  Avg eff_rank: {stats['avg_eff_rank']}",
                      f"  Avg coherence: {stats['avg_coherence']}",
+                     f"  Avg role_diversity: {stats.get('avg_role_diversity', 0)}",
                      f"  Embedding: {stats['embedding_model']} ({stats['embedding_dim']}d)"]
             if poll_line:
                 lines.insert(1, poll_line)
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        elif name == "maintenance_cycle":
+            max_branches_raw = arguments.get("max_branches")
+            max_branches = None
+            if max_branches_raw is not None:
+                try:
+                    max_branches = max(1, int(max_branches_raw))
+                except Exception:
+                    max_branches = None
+            reset_chunk_cursor = bool(arguments.get("reset_chunk_cursor", False))
+            result = do_maintenance_cycle(
+                max_branches=max_branches,
+                reset_chunk_cursor=reset_chunk_cursor,
+            )
+            lines = [" Maintenance cycle completed"]
+            if poll_line:
+                lines.append(poll_line)
+            lines.append(f"  recomputed: {result.get('recomputed', 0)}")
+            lines.append(f"  split_pending: {result.get('split_pending', 0)}")
+            lines.append(f"  split_executed: {result.get('split_executed', 0)}")
+            lines.append(f"  merge_candidates: {result.get('merge_candidates', 0)}")
+            lines.append(f"  merge_executed: {result.get('merge_executed', 0)}")
+            lines.append(f"  dormant_marked: {result.get('dormant_marked', 0)}")
+            lines.append(f"  reactivated: {result.get('reactivated', 0)}")
+            lines.append(f"  refines_orphans_removed: {result.get('refines_orphans_removed', 0)}")
+            chunk = result.get("maintenance_chunking", {}) or {}
+            if chunk:
+                lines.append(
+                    "  chunking: "
+                    f"enabled={chunk.get('enabled')} size={chunk.get('chunk_size')} "
+                    f"selected={chunk.get('selected_branches')} wrapped={chunk.get('wrapped')} "
+                    f"cursor_before={chunk.get('cursor_before')} cursor_after={chunk.get('cursor_after')}"
+                )
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "sync_lcm_ingest":
@@ -1273,6 +1467,65 @@ async def call_tool(name, arguments):
                 f"temporal_next={orphan.get('temporal_next', 0)} "
                 f"refines={orphan.get('refines', 0)}"
             )
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        elif name == "backfill_lcm_conversations":
+            conv_ids_raw = arguments.get("conversation_ids", [])
+            if not isinstance(conv_ids_raw, list) or not conv_ids_raw:
+                return [TextContent(type="text", text="Error: conversation_ids must be a non-empty array of integers")]
+            conv_ids = []
+            for x in conv_ids_raw:
+                try:
+                    conv_ids.append(int(x))
+                except Exception:
+                    continue
+            conv_ids = [x for x in conv_ids if x > 0]
+            if not conv_ids:
+                return [TextContent(type="text", text="Error: no valid positive conversation_ids were provided")]
+
+            max_per_conv_raw = arguments.get("max_per_conv", 200)
+            try:
+                max_per_conv = max(2, int(max_per_conv_raw))
+            except Exception:
+                max_per_conv = 200
+            resume = bool(arguments.get("resume", True))
+            dry_run = bool(arguments.get("dry_run", False))
+
+            gc = get_gc()
+            result = gc.backfill_selected_conversations_from_lcm(
+                lcm_db_path=LCM_DB,
+                conversation_ids=conv_ids,
+                max_per_conv=max_per_conv,
+                resume=resume,
+                dry_run=dry_run,
+            )
+            title = " Targeted backfill completed"
+            if result.get("aborted", False):
+                title = " Targeted backfill aborted (preflight)"
+            lines = [title]
+            if poll_line:
+                lines.append(poll_line)
+            lines.append(f"  requested: {result.get('requested', 0)}")
+            lines.append(f"  found_with_messages: {result.get('found_with_messages', 0)}")
+            lines.append(f"  processed: {result.get('processed', 0)}")
+            lines.append(f"  skipped: {result.get('skipped', 0)} (resume={result.get('skipped_resume', 0)}, empty={result.get('skipped_empty', 0)})")
+            lines.append(f"  failed: {result.get('failed', 0)}")
+            lines.append(f"  sampled: {result.get('sampled', 0)}")
+            lines.append(f"  dry_run: {result.get('dry_run', False)}")
+            if "provider_ready" in result:
+                lines.append(f"  provider_ready: {result.get('provider_ready')}")
+            if result.get("preflight_error"):
+                lines.append(f"  preflight_error: {result.get('preflight_error')}")
+            details = result.get("details", []) or []
+            if details:
+                lines.append("  details:")
+                for d in details[:20]:
+                    lines.append(
+                        f"   - conv_{d.get('conversation_id')} -> {d.get('status')} "
+                        f"(messages={d.get('messages')}, sampled={d.get('sampled', False)})"
+                    )
+                if len(details) > 20:
+                    lines.append(f"   - ... ({len(details) - 20} more)")
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "conversation_content":

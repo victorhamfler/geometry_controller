@@ -156,6 +156,8 @@ class GeometryConfig:
     split_child_copy_usefulness: bool = True
     split_child_copy_retrieval_error: bool = True
     split_child_anchor_from_centroid: bool = True
+    maintenance_chunk_size: int = 0  # 0 = full-cycle scan (legacy behavior)
+    maintenance_chunk_cursor_key: str = "maintenance_cycle_branch_cursor_v1"
     tension_threshold: float = 0.70  # CSD above this → TENSIONED state
     beta1_comp: float = 0.50
     beta2_comp: float = 0.30
@@ -295,6 +297,7 @@ class BranchStats:
 
     # Counts & feedback
     node_count:          int   = 0
+    role_diversity:      float = 0.0
     contradiction_density: float = 0.0
     retrieval_error:     float = 0.0
     usefulness:          float = 0.0
@@ -479,6 +482,7 @@ CREATE TABLE IF NOT EXISTS branch_states (
     coherence            REAL DEFAULT 0.0,
     compression_loss     REAL DEFAULT 0.0,
     node_count           INTEGER DEFAULT 0,
+    role_diversity       REAL DEFAULT 0.0,
     topic_drift_density   REAL DEFAULT 0.0,
     contradiction_density REAL DEFAULT 0.0,
     retrieval_error      REAL DEFAULT 0.0,
@@ -497,6 +501,8 @@ CREATE TABLE IF NOT EXISTS retrieval_feedback (
     used        INTEGER DEFAULT 0,
     corrected   INTEGER DEFAULT 0,
     expanded    INTEGER DEFAULT 0,
+    usefulness_signal REAL,
+    feedback_source   TEXT DEFAULT 'explicit',
     timestamp   REAL
 );
 
@@ -508,6 +514,12 @@ CREATE TABLE IF NOT EXISTS maintenance_jobs (
     payload_json  TEXT,
     created_ts    REAL,
     completed_ts  REAL
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_state (
+    state_key    TEXT PRIMARY KEY,
+    state_value  TEXT,
+    updated_ts   REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS maintenance_split_observations (
@@ -1243,6 +1255,10 @@ class GeometryDB:
             self._conn.execute(
                 "ALTER TABLE branch_states ADD COLUMN topic_drift_density REAL DEFAULT 0.0"
             )
+        if "role_diversity" not in branch_cols:
+            self._conn.execute(
+                "ALTER TABLE branch_states ADD COLUMN role_diversity REAL DEFAULT 0.0"
+            )
         # Backfill topic_drift_density from legacy contradiction_density when possible.
         if "contradiction_density" in branch_cols:
             self._conn.execute(
@@ -1273,6 +1289,18 @@ class GeometryDB:
             self._conn.execute(
                 "ALTER TABLE memory_nodes ADD COLUMN correction_root_id TEXT"
             )
+        retrieval_cols = {
+            str(r["name"])
+            for r in self._conn.execute("PRAGMA table_info(retrieval_feedback)").fetchall()
+        }
+        if "usefulness_signal" not in retrieval_cols:
+            self._conn.execute(
+                "ALTER TABLE retrieval_feedback ADD COLUMN usefulness_signal REAL"
+            )
+        if "feedback_source" not in retrieval_cols:
+            self._conn.execute(
+                "ALTER TABLE retrieval_feedback ADD COLUMN feedback_source TEXT DEFAULT 'explicit'"
+            )
         if "correction_version" not in node_cols:
             self._conn.execute(
                 "ALTER TABLE memory_nodes ADD COLUMN correction_version INTEGER DEFAULT 1"
@@ -1296,7 +1324,7 @@ class GeometryDB:
                  mean_vec, anchor, cov_diagonal,
                  eff_rank, trace, anisotropy, anchor_drift,
                  coherence, compression_loss,
-                 node_count, topic_drift_density, contradiction_density,
+                 node_count, role_diversity, topic_drift_density, contradiction_density,
                  retrieval_error, usefulness, reactivation_score,
                  split_counter, merge_counter, last_update_ts)
             VALUES
@@ -1304,7 +1332,7 @@ class GeometryDB:
                  :mean_vec, :anchor, :cov_diagonal,
                  :eff_rank, :trace, :anisotropy, :anchor_drift,
                  :coherence, :compression_loss,
-                 :node_count, :contradiction_density, :contradiction_density,
+                 :node_count, :role_diversity, :contradiction_density, :contradiction_density,
                  :retrieval_error, :usefulness, :reactivation_score,
                  :split_counter, :merge_counter, :last_update_ts)
         """, d)
@@ -1325,6 +1353,7 @@ class GeometryDB:
                 coherence=?,
                 compression_loss=?,
                 node_count=?,
+                role_diversity=?,
                 topic_drift_density=?,
                 contradiction_density=?,
                 retrieval_error=?,
@@ -1346,6 +1375,7 @@ class GeometryDB:
                 float(s.coherence),
                 float(s.compression_loss),
                 int(s.node_count),
+                float(getattr(s, "role_diversity", 0.0)),
                 float(s.contradiction_density),
                 float(s.contradiction_density),
                 float(s.retrieval_error),
@@ -1391,13 +1421,14 @@ class GeometryDB:
         self,
         include_states: Optional[set[BranchState | str]] = None,
         exclude_states: Optional[set[BranchState | str]] = None,
+        branch_ids: Optional[list[str]] = None,
         limit: Optional[int] = None,
     ) -> list[dict[str, Any]]:
         q = (
             "SELECT "
             "branch_id, branch_type, state, regime, "
             "eff_rank, trace, anisotropy, anchor_drift, "
-            "coherence, compression_loss, node_count, "
+            "coherence, compression_loss, node_count, role_diversity, "
             "COALESCE(topic_drift_density, contradiction_density, 0.0) AS topic_drift_density, "
             "retrieval_error, usefulness, reactivation_score, "
             "split_counter, merge_counter, last_update_ts, "
@@ -1417,6 +1448,14 @@ class GeometryDB:
             ph = ",".join(["?"] * len(vals))
             clauses.append(f"state NOT IN ({ph})")
             params.extend(vals)
+        if branch_ids:
+            clean_ids = [str(bid).strip() for bid in branch_ids if str(bid).strip()]
+            if clean_ids:
+                ph = ",".join(["?"] * len(clean_ids))
+                clauses.append(f"branch_id IN ({ph})")
+                params.extend(clean_ids)
+            else:
+                return []
         if clauses:
             q += " WHERE " + " AND ".join(clauses)
         q += " ORDER BY COALESCE(last_update_ts, 0.0) DESC"
@@ -1771,6 +1810,63 @@ class GeometryDB:
             out.append(row)
         return out
 
+    def branch_role_counts(self, branch_id: str) -> dict[str, int]:
+        rows = self.conn.execute(
+            """
+            SELECT COALESCE(role, 'unknown') AS role, COUNT(*) AS c
+            FROM memory_nodes
+            WHERE branch_id=?
+            GROUP BY COALESCE(role, 'unknown')
+            ORDER BY c DESC
+            """,
+            (branch_id,),
+        ).fetchall()
+        return {str(r["role"]): int(r["c"] or 0) for r in rows}
+
+    def list_branch_ids_for_chunk(
+        self,
+        limit: int,
+        after_branch_id: Optional[str] = None,
+    ) -> list[str]:
+        lim = max(1, int(limit))
+        if after_branch_id:
+            rows = self.conn.execute(
+                "SELECT branch_id FROM branch_states WHERE branch_id > ? ORDER BY branch_id ASC LIMIT ?",
+                (str(after_branch_id), lim),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT branch_id FROM branch_states ORDER BY branch_id ASC LIMIT ?",
+                (lim,),
+            ).fetchall()
+        return [str(r["branch_id"]) for r in rows if str(r["branch_id"] or "").strip()]
+
+    def get_maintenance_state(self, state_key: str) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT state_value FROM maintenance_state WHERE state_key=?",
+            (str(state_key),),
+        ).fetchone()
+        if row is None:
+            return None
+        val = row["state_value"]
+        if val is None:
+            return None
+        text = str(val).strip()
+        return text if text else None
+
+    def set_maintenance_state(self, state_key: str, state_value: Optional[str]) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO maintenance_state (state_key, state_value, updated_ts)
+            VALUES (?, ?, ?)
+            ON CONFLICT(state_key) DO UPDATE SET
+                state_value=excluded.state_value,
+                updated_ts=excluded.updated_ts
+            """,
+            (str(state_key), str(state_value) if state_value else None, time.time()),
+        )
+        self.conn.commit()
+
     def branch_update_mode_counts(self, branch_id: str) -> dict[str, int]:
         rows = self.conn.execute(
             """
@@ -1943,6 +2039,27 @@ class GeometryDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def cleanup_orphan_refines_edges(self) -> int:
+        """
+        Remove refines edges that reference missing memory_nodes rows.
+
+        This handles stale lineage links after node deletions where src_id/dst_id
+        values are present but the referenced node records no longer exist.
+        """
+        cur = self.conn.execute(
+            """
+            DELETE FROM memory_edges
+            WHERE edge_type = ?
+              AND (
+                    NOT EXISTS (SELECT 1 FROM memory_nodes s WHERE s.id = memory_edges.src_id)
+                 OR NOT EXISTS (SELECT 1 FROM memory_nodes d WHERE d.id = memory_edges.dst_id)
+              )
+            """,
+            (EdgeType.REFINES.value,),
+        )
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
     # ---- Retrieval feedback ----
 
     def log_retrieval(
@@ -1953,21 +2070,32 @@ class GeometryDB:
         used: bool = False,
         corrected: bool = False,
         expanded: bool = False,
+        usefulness_signal: Optional[float] = None,
+        feedback_source: str = "explicit",
     ) -> None:
+        signal_value: Optional[float] = None
+        if usefulness_signal is not None:
+            try:
+                signal_value = float(usefulness_signal)
+            except Exception:
+                signal_value = None
+            if signal_value is not None:
+                signal_value = max(0.0, min(1.0, signal_value))
+        source = str(feedback_source or "explicit").strip().lower() or "explicit"
         self.conn.execute("""
             INSERT INTO retrieval_feedback
-            (id, query_id, branch_id, score, used, corrected, expanded, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (id, query_id, branch_id, score, used, corrected, expanded, usefulness_signal, feedback_source, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             str(uuid.uuid4()), query_id, branch_id, score,
-            int(used), int(corrected), int(expanded), time.time(),
+            int(used), int(corrected), int(expanded), signal_value, source, time.time(),
         ))
         self.conn.commit()
 
     def branch_retrieval_stats(self, branch_id: str) -> dict[str, float]:
         row = self.conn.execute("""
             SELECT
-                AVG(used)      AS avg_used,
+                AVG(CASE WHEN usefulness_signal IS NULL THEN used ELSE usefulness_signal END) AS avg_usefulness,
                 AVG(corrected) AS avg_corrected,
                 AVG(expanded)  AS avg_expanded,
                 COUNT(*)       AS total
@@ -1976,7 +2104,7 @@ class GeometryDB:
         if row is None or row["total"] == 0:
             return {"usefulness": 0.5, "error_rate": 0.0}
         return {
-            "usefulness": float(row["avg_used"] or 0.5),
+            "usefulness": float(row["avg_usefulness"] if row["avg_usefulness"] is not None else 0.5),
             "error_rate": float(row["avg_corrected"] or 0.0),
         }
 
@@ -2196,6 +2324,7 @@ class GeometryController:
             coherence=float(row.get("coherence") or 0.0),
             compression_loss=float(row.get("compression_loss") or 0.0),
             node_count=int(row.get("node_count") or 0),
+            role_diversity=float(row.get("role_diversity") or 0.0),
             contradiction_density=float(
                 row.get("topic_drift_density")
                 if row.get("topic_drift_density") is not None
@@ -2497,14 +2626,30 @@ class GeometryController:
         used:      bool = False,
         corrected: bool = False,
         expanded:  bool = False,
+        usefulness_signal: Optional[float] = None,
+        feedback_source: str = "explicit",
     ) -> None:
         """Log the outcome of a retrieval for usefulness-EMA updating."""
-        self.db.log_retrieval(query_id, branch_id, score, used, corrected, expanded)
+        self.db.log_retrieval(
+            query_id,
+            branch_id,
+            score,
+            used=used,
+            corrected=corrected,
+            expanded=expanded,
+            usefulness_signal=usefulness_signal,
+            feedback_source=feedback_source,
+        )
         # Update usefulness EMA on the branch
-        fb = self.db.branch_retrieval_stats(branch_id)
         stats = self.db.load_branch(branch_id)
         if stats:
-            reward = 1.0 if used and not corrected else (-0.5 if corrected else 0.0)
+            if usefulness_signal is None:
+                reward = 1.0 if used and not corrected else (-0.5 if corrected else 0.0)
+            else:
+                try:
+                    reward = max(0.0, min(1.0, float(usefulness_signal)))
+                except Exception:
+                    reward = 0.5
             lam = self.cfg.usefulness_lambda
             stats.usefulness    = (1 - lam) * stats.usefulness + lam * reward
             stats.retrieval_error = (1 - lam) * stats.retrieval_error + lam * float(corrected)
@@ -2554,7 +2699,11 @@ class GeometryController:
     # 5. Maintenance cycle (run periodically or via background LLM-Map)
     # ------------------------------------------------------------------
 
-    def run_maintenance_cycle(self) -> dict[str, Any]:
+    def run_maintenance_cycle(
+        self,
+        max_branches: Optional[int] = None,
+        reset_chunk_cursor: bool = False,
+    ) -> dict[str, Any]:
         """
         Runs offline maintenance:
           - geometry recompute
@@ -2572,7 +2721,25 @@ class GeometryController:
             "dormant_marked": 0,
             "reactivated": 0,
             "split_observations": 0,
+            "refines_orphans_removed": 0,
         }
+        actions["refines_orphans_removed"] = self.db.cleanup_orphan_refines_edges()
+        chunk_size_cfg = (
+            int(max_branches)
+            if max_branches is not None
+            else int(getattr(self.cfg, "maintenance_chunk_size", 0) or 0)
+        )
+        chunk_size = max(0, chunk_size_cfg)
+        chunk_cursor_key = str(
+            getattr(self.cfg, "maintenance_chunk_cursor_key", "maintenance_cycle_branch_cursor_v1")
+            or "maintenance_cycle_branch_cursor_v1"
+        )
+        cursor_before: Optional[str] = None
+        cursor_after: Optional[str] = None
+        chunk_wrapped = False
+        selected_branch_ids: list[str] = []
+        if reset_chunk_cursor and chunk_size > 0:
+            self.db.set_maintenance_state(chunk_cursor_key, None)
         split_run_id = str(uuid.uuid4())
         actions["split_trace_run_id"] = split_run_id
         split_threshold = float(self.cfg.split_score_threshold)
@@ -2581,7 +2748,36 @@ class GeometryController:
         split_enqueue_cap = max(0, int(self.cfg.max_split_enqueues_per_cycle))
         split_candidates: list[dict[str, Any]] = []
         split_observations: list[dict[str, Any]] = []
-        scalar_rows = self.db.list_branch_scalars()
+        if chunk_size > 0:
+            cursor_before = self.db.get_maintenance_state(chunk_cursor_key)
+            selected_branch_ids = self.db.list_branch_ids_for_chunk(
+                limit=chunk_size,
+                after_branch_id=cursor_before,
+            )
+            if not selected_branch_ids:
+                chunk_wrapped = True
+                self.db.set_maintenance_state(chunk_cursor_key, None)
+                cursor_before = None
+                selected_branch_ids = self.db.list_branch_ids_for_chunk(
+                    limit=chunk_size,
+                    after_branch_id=None,
+                )
+            if selected_branch_ids:
+                cursor_after = selected_branch_ids[-1]
+                self.db.set_maintenance_state(chunk_cursor_key, cursor_after)
+            scalar_rows = self.db.list_branch_scalars(branch_ids=selected_branch_ids)
+        else:
+            scalar_rows = self.db.list_branch_scalars()
+        actions["maintenance_chunking"] = {
+            "enabled": bool(chunk_size > 0),
+            "chunk_size": int(chunk_size),
+            "selected_branches": int(len(selected_branch_ids)),
+            "cursor_key": chunk_cursor_key if chunk_size > 0 else None,
+            "cursor_before": cursor_before,
+            "cursor_after": cursor_after,
+            "wrapped": bool(chunk_wrapped),
+            "reset_chunk_cursor": bool(reset_chunk_cursor),
+        }
         all_stats: list[BranchStats] = []
         has_mean_by_id: dict[str, bool] = {}
         for row in scalar_rows:
@@ -2602,6 +2798,13 @@ class GeometryController:
         for i, s in enumerate(all_stats):
             if s is None:
                 continue
+            role_counts = self.db.branch_role_counts(s.branch_id)
+            total_role_rows = int(sum(int(v or 0) for v in role_counts.values()))
+            unique_roles = int(sum(1 for v in role_counts.values() if int(v or 0) > 0))
+            s.role_diversity = (
+                float(unique_roles) / float(total_role_rows)
+                if total_role_rows > 0 else 0.0
+            )
 
             embs, weights = self.db.get_branch_embeddings(s.branch_id)
             if embs.shape[0] >= self.cfg.min_branch_size:
@@ -2609,6 +2812,7 @@ class GeometryController:
                 if full_s is None:
                     continue
                 full_loaded_ids.add(full_s.branch_id)
+                full_s.role_diversity = float(s.role_diversity)
                 mu = GeometryMath.weighted_mean(embs, weights)
                 stats_dict = GeometryMath.compute_full_stats(embs, weights, mu)
                 rho = self.cfg.stat_rho
@@ -4034,10 +4238,12 @@ class GeometryController:
             "coherence":         round(s.coherence, 3),
             "compression_loss":  round(s.compression_loss, 3),
             "node_count":        s.node_count,
+            "role_diversity":    round(float(getattr(s, "role_diversity", 0.0) or 0.0), 4),
             "usefulness":        round(s.usefulness, 3),
             "contradiction_density": round(s.contradiction_density, 3),
             "topic_drift_density": round(s.contradiction_density, 3),
             "subtopic_diversity_density": round(s.contradiction_density, 3),
+            "role_counts": self.db.branch_role_counts(branch_id),
             "update_mode_counts": self.db.branch_update_mode_counts(branch_id),
             "correction_counts": self.db.branch_correction_counts(branch_id),
             "recent_corrections": self.db.recent_corrections(branch_id, limit=8),
@@ -4413,6 +4619,203 @@ class GeometryController:
                 flush_batch()
 
         flush_batch()
+
+        lcm.close()
+        return stats
+
+    def backfill_selected_conversations_from_lcm(
+        self,
+        lcm_db_path: str,
+        conversation_ids: list[int],
+        max_per_conv: int = 200,
+        resume: bool = True,
+        dry_run: bool = False,
+        progress_cb=None,   # Optional[Callable[[int,int], None]]
+        error_log_path: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Targeted backfill for specific LCM conversation IDs.
+
+        This is intended for recovering known zombie branches (e.g. conv_57, conv_365)
+        without running a full historical backfill.
+        """
+        clean_ids: list[int] = []
+        seen: set[int] = set()
+        for raw in conversation_ids or []:
+            try:
+                cid = int(raw)
+            except Exception:
+                continue
+            if cid <= 0 or cid in seen:
+                continue
+            seen.add(cid)
+            clean_ids.append(cid)
+
+        stats: dict[str, Any] = {
+            "requested": len(clean_ids),
+            "found_with_messages": 0,
+            "processed": 0,
+            "skipped": 0,
+            "skipped_resume": 0,
+            "skipped_empty": 0,
+            "failed": 0,
+            "sampled": 0,
+            "errors_logged": 0,
+            "dry_run": bool(dry_run),
+            "provider_ready": bool(self.embedding_provider is not None),
+            "aborted": False,
+            "preflight_error": "",
+            "max_per_conv": int(max_per_conv),
+            "conversation_ids": clean_ids,
+            "details": [],
+        }
+        if not clean_ids:
+            return stats
+
+        lcm = sqlite3.connect(lcm_db_path)
+        lcm.row_factory = sqlite3.Row
+        q = ",".join(["?"] * len(clean_ids))
+        rows = lcm.execute(
+            f"SELECT message_id, conversation_id, role, content, token_count, created_at "
+            f"FROM messages WHERE conversation_id IN ({q}) ORDER BY conversation_id, created_at",
+            tuple(clean_ids),
+        ).fetchall()
+
+        convs: dict[int, list[sqlite3.Row]] = {cid: [] for cid in clean_ids}
+        for r in rows:
+            cid = int(r["conversation_id"])
+            if cid not in convs:
+                convs[cid] = []
+            convs[cid].append(r)
+
+        already_done = (
+            {b.branch_id for b in self.db.all_branches()}
+            if resume else set()
+        )
+        error_log = error_log_path or self._default_backfill_error_log_path()
+        total = len(clean_ids)
+
+        if not dry_run and self.embedding_provider is None:
+            preflight_error = (
+                "backfill_selected_conversations_from_lcm requires self.embedding_provider "
+                "when dry_run=False."
+            )
+            stats["aborted"] = True
+            stats["preflight_error"] = preflight_error
+            for i, cid in enumerate(clean_ids):
+                branch_id = f"conv_{cid}"
+                msgs = convs.get(cid, [])
+                detail: dict[str, Any] = {
+                    "conversation_id": int(cid),
+                    "branch_id": branch_id,
+                    "messages": int(len(msgs)),
+                    "status": "pending",
+                    "sampled": False,
+                }
+
+                if resume and branch_id in already_done:
+                    stats["skipped"] += 1
+                    stats["skipped_resume"] += 1
+                    detail["status"] = "skipped_resume"
+                elif not msgs:
+                    stats["skipped"] += 1
+                    stats["skipped_empty"] += 1
+                    detail["status"] = "skipped_empty"
+                else:
+                    stats["found_with_messages"] += 1
+                    if len(msgs) > max_per_conv:
+                        stats["sampled"] += 1
+                        detail["sampled"] = True
+                        detail["messages_original"] = int(len(msgs))
+                        detail["messages"] = int(max_per_conv)
+                    stats["failed"] += 1
+                    detail["status"] = "failed_preflight"
+                    detail["error"] = preflight_error
+
+                stats["details"].append(detail)
+                if progress_cb:
+                    progress_cb(i + 1, total)
+            lcm.close()
+            return stats
+
+        for i, cid in enumerate(clean_ids):
+            branch_id = f"conv_{cid}"
+            msgs = convs.get(cid, [])
+            detail: dict[str, Any] = {
+                "conversation_id": int(cid),
+                "branch_id": branch_id,
+                "messages": int(len(msgs)),
+                "status": "pending",
+                "sampled": False,
+            }
+
+            if resume and branch_id in already_done:
+                stats["skipped"] += 1
+                stats["skipped_resume"] += 1
+                detail["status"] = "skipped_resume"
+                stats["details"].append(detail)
+                if progress_cb:
+                    progress_cb(i + 1, total)
+                continue
+
+            if not msgs:
+                stats["skipped"] += 1
+                stats["skipped_empty"] += 1
+                detail["status"] = "skipped_empty"
+                stats["details"].append(detail)
+                if progress_cb:
+                    progress_cb(i + 1, total)
+                continue
+
+            stats["found_with_messages"] += 1
+            if len(msgs) > max_per_conv:
+                stats["sampled"] += 1
+                detail["sampled"] = True
+                detail["messages_original"] = int(len(msgs))
+                keep = max(2, int(max_per_conv))
+                step = len(msgs) / keep
+                msgs = [msgs[0], msgs[-1]] + [
+                    msgs[int(j * step)] for j in range(1, int(keep) - 1)
+                ]
+                msgs = msgs[:max_per_conv]
+                detail["messages"] = int(len(msgs))
+
+            try:
+                if not dry_run:
+                    if self.embedding_provider is None:
+                        raise ValueError(
+                            "backfill_selected_conversations_from_lcm requires self.embedding_provider "
+                            "unless dry_run=True."
+                        )
+                    texts = [m["content"] or "" for m in msgs]
+                    embeddings = self.embedding_provider.embed_batch(texts)
+                    for msg, emb in zip(msgs, embeddings):
+                        self.on_new_item(
+                            lcm_id=msg["message_id"],
+                            node_type=NodeType.MESSAGE,
+                            embedding=emb,
+                            role=msg["role"] or "user",
+                            token_count=msg["token_count"] or 0,
+                            force_branch_id=branch_id,
+                        )
+                stats["processed"] += 1
+                detail["status"] = "processed"
+            except Exception as exc:
+                stats["failed"] += 1
+                detail["status"] = "failed"
+                detail["error"] = str(exc)
+                self._append_backfill_error(
+                    error_log,
+                    conv_id=int(cid),
+                    branch_id=branch_id,
+                    message_count=len(msgs),
+                    exc=exc,
+                )
+                stats["errors_logged"] += 1
+            finally:
+                stats["details"].append(detail)
+                if progress_cb:
+                    progress_cb(i + 1, total)
 
         lcm.close()
         return stats

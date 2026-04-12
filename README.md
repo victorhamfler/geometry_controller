@@ -2,7 +2,7 @@
 
 Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geometry-aware tools.
 
-## Latest Update (2026-04-09)
+## Latest Update (2026-04-12)
 
 - Added scalar/lazy branch loading paths:
   - retrieval prefilter by branch scalars (`retrieval_prefilter_limit`)
@@ -69,6 +69,11 @@ Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geomet
 - Added branch-type metric profiles:
   - optional `branch_type_profiles` lets branch classes override CSD/retrieval/split/merge weights
   - default behavior is unchanged when no profile is configured
+- Hardened targeted backfill preflight:
+  - `backfill_selected_conversations_from_lcm(...)` now reports `provider_ready`, `aborted`, and `preflight_error`
+  - real mode (`dry_run=false`) now fails clearly with `failed_preflight` details when no embedding provider is configured
+- Improved MCP targeted-backfill visibility:
+  - `backfill_lcm_conversations` now surfaces provider readiness and preflight abort reason in tool output
 - MCP server now supports runtime config file/env overrides:
   - `extensions/geometry-mcp/runtime_config.json`
   - `GEOMETRY_RUNTIME_CONFIG_JSON`
@@ -252,10 +257,13 @@ Useful keys in `geometry_config`:
 ## MCP tools provided
 
 - `hybrid_search` - combined semantic + keyword retrieval with recommendation (`geometry` / `lcm` / `both`), now with optional `retrieval_mode` (`balanced` / `factual` / `exploratory`)
+- `retrieval_feedback` - record explicit feedback for `hybrid_search` results using `query_id` and `branch_id`
 - `branch_report` - branch diagnostics (state, regime, rank/coherence/anisotropy, etc.)
 - `geometry_stats` - global DB health and distribution stats
+- `maintenance_cycle` - run one maintenance cycle, optionally chunked (`max_branches`) with optional cursor reset
 - `sync_lcm_ingest` - force one incremental ingest poll from `lcm.db` into geometry DB
 - `sync_lcm_dag_edges` - rebuild imported DAG edges (`summarizes`, `derived_from`) and return orphan-validation counters
+- `backfill_lcm_conversations` - targeted backfill for specific LCM conversation IDs with dry-run and resume options
 - `conversation_content` - geometry-to-LCM text bridge (summaries/messages by branch/state) with lineage-aware resolution metadata
 
 ## Typical usage flow

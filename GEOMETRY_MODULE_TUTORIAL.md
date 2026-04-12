@@ -38,14 +38,17 @@ Current runtime uses inactivity + usefulness policy to move ACTIVE/STABLE/TENSIO
 
 ## 3. MCP tools
 
-Use these 6 tools exposed by `geometry-hybrid`:
+Use these 9 tools exposed by `geometry-hybrid`:
 
 - `geometry-hybrid__hybrid_search`: combined semantic + keyword ranking.
+- `geometry-hybrid__retrieval_feedback`: explicit feedback for a `hybrid_search` result (`query_id`, `branch_id`).
 - `geometry-hybrid__conversation_content`: read summaries/messages for a branch (`conv_*`).
 - `geometry-hybrid__branch_report`: inspect one branch (state/regime/metrics + `update_mode_counts`).
 - `geometry-hybrid__geometry_stats`: global geometry DB health metrics.
+- `geometry-hybrid__maintenance_cycle`: run one maintenance cycle (supports chunking via `max_branches`).
 - `geometry-hybrid__sync_lcm_ingest`: force one incremental LCM->geometry ingest poll.
 - `geometry-hybrid__sync_lcm_dag_edges`: rebuild imported DAG edges and return orphan-validation counters.
+- `geometry-hybrid__backfill_lcm_conversations`: targeted backfill for specific LCM conversation IDs.
 
 Recommended flow: `hybrid_search` -> `branch_report` (if needed) -> `conversation_content`.
 
@@ -65,6 +68,11 @@ For `hybrid_search`, use:
 - `retrieval_mode="factual"` when precision/reliability matters.
 - `retrieval_mode="exploratory"` when broad discovery matters.
 - `retrieval_mode="balanced"` for normal usage.
+
+For `backfill_lcm_conversations`:
+- Use `dry_run=true` for preview mode without embeddings.
+- Real mode (`dry_run=false`) needs an embedding provider.
+- If provider is missing, output shows `provider_ready=false`, `aborted=true`, and `preflight_error`.
 
 ---
 
