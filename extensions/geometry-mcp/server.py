@@ -708,6 +708,48 @@ def do_maintenance_cycle(max_branches=None, reset_chunk_cursor=False):
     return gc.run_maintenance_cycle(**kwargs)
 
 
+def do_geometry_snapshot(branch_ids=None, state=None, limit=None, include_means=False):
+    gc = get_gc()
+
+    clean_ids = None
+    if isinstance(branch_ids, list):
+        out = []
+        seen = set()
+        for raw in branch_ids:
+            bid = str(raw or "").strip()
+            if not bid or bid in seen:
+                continue
+            seen.add(bid)
+            out.append(bid)
+        clean_ids = out or None
+
+    safe_state = str(state or "").strip().upper() or None
+
+    safe_limit = None
+    if limit is not None:
+        try:
+            safe_limit = max(1, int(limit))
+        except Exception:
+            safe_limit = None
+
+    return gc.export_geometry_snapshot(
+        branch_ids=clean_ids,
+        state=safe_state,
+        limit=safe_limit,
+        include_means=bool(include_means),
+    )
+
+
+def do_latest_correction(node_id, branch_id=None, include_chain=False, chain_limit=64):
+    gc = get_gc()
+    return gc.get_latest_correction(
+        node_id=str(node_id or "").strip(),
+        branch_id=str(branch_id or "").strip() or None,
+        include_chain=bool(include_chain),
+        chain_limit=max(1, int(chain_limit or 64)),
+    )
+
+
 #  Conversation content (geometry  LCM bridge) 
 def _get_lcm_content(lcm_conn, conv_id, content_type, max_entries, max_chars):
     """Get content from LCM database for a conversation."""
@@ -1128,6 +1170,63 @@ async def list_tools():
             }
         ),
         Tool(
+            name="geometry_snapshot",
+            description=(
+                "Export a compact branch snapshot for ops/debugging. "
+                "Supports state filter, explicit branch IDs, row limit, and optional mean vectors."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "branch_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional explicit branch IDs to export (e.g. [\"conv_148\",\"day_2026-04-07\"])."
+                    },
+                    "state": {
+                        "type": "string",
+                        "description": "Optional lifecycle state filter (e.g. ACTIVE, STABLE, COLLAPSING, ALL)."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional max branches to return."
+                    },
+                    "include_means": {
+                        "type": "boolean",
+                        "description": "Include branch mean vectors in output (larger payload)."
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="latest_correction",
+            description=(
+                "Resolve a correction chain and return the latest correction node/version for a seed node_id."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node_id": {
+                        "type": "string",
+                        "description": "Seed geometry node id from any point in a correction chain."
+                    },
+                    "branch_id": {
+                        "type": "string",
+                        "description": "Optional branch scope when same root may appear across branches."
+                    },
+                    "include_chain": {
+                        "type": "boolean",
+                        "description": "Include ordered correction chain payload."
+                    },
+                    "chain_limit": {
+                        "type": "integer",
+                        "description": "Max chain entries to return when include_chain=true (default 64)."
+                    }
+                },
+                "required": ["node_id"]
+            }
+        ),
+        Tool(
             name="sync_lcm_ingest",
             description=(
                 "Force an immediate incremental poll of new LCM messages into geometry DB. "
@@ -1393,6 +1492,9 @@ async def call_tool(name, arguments):
             lines.append(f"  dormant_marked: {result.get('dormant_marked', 0)}")
             lines.append(f"  reactivated: {result.get('reactivated', 0)}")
             lines.append(f"  refines_orphans_removed: {result.get('refines_orphans_removed', 0)}")
+            lines.append(f"  retrieval_feedback_pruned: {result.get('retrieval_feedback_pruned', 0)}")
+            lines.append(f"  retrieval_feedback_pruned_age: {result.get('retrieval_feedback_pruned_age', 0)}")
+            lines.append(f"  retrieval_feedback_pruned_cap: {result.get('retrieval_feedback_pruned_cap', 0)}")
             chunk = result.get("maintenance_chunking", {}) or {}
             if chunk:
                 lines.append(
@@ -1401,6 +1503,92 @@ async def call_tool(name, arguments):
                     f"selected={chunk.get('selected_branches')} wrapped={chunk.get('wrapped')} "
                     f"cursor_before={chunk.get('cursor_before')} cursor_after={chunk.get('cursor_after')}"
                 )
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        elif name == "geometry_snapshot":
+            branch_ids = arguments.get("branch_ids")
+            state = arguments.get("state")
+            limit_raw = arguments.get("limit")
+            include_means = bool(arguments.get("include_means", False))
+
+            limit = None
+            if limit_raw is not None:
+                try:
+                    limit = max(1, int(limit_raw))
+                except Exception:
+                    limit = None
+
+            result = do_geometry_snapshot(
+                branch_ids=branch_ids if isinstance(branch_ids, list) else None,
+                state=state,
+                limit=limit,
+                include_means=include_means,
+            )
+            branches = result.get("branches", []) or []
+            lines = [
+                " Geometry snapshot export",
+                f"  branch_count: {result.get('branch_count', len(branches))}",
+                f"  state_filter: {result.get('state_filter', 'ALL')}",
+                f"  include_means: {bool(result.get('include_means', False))}",
+                f"  generated_ts: {result.get('generated_ts', 0)}",
+                "",
+            ]
+            if poll_line:
+                lines.insert(1, poll_line)
+            for i, b in enumerate(branches[:50], 1):
+                lines.append(
+                    f"  {i}. {b.get('branch_id')} | {b.get('state')}/{b.get('regime')} "
+                    f"| nodes={b.get('node_count', 0)} | eff_rank={round(float(b.get('eff_rank', 0.0) or 0.0), 3)} "
+                    f"| drift={round(float(b.get('anchor_drift', 0.0) or 0.0), 4)} "
+                    f"| role_div={round(float(b.get('role_diversity', 0.0) or 0.0), 4)}"
+                )
+            if len(branches) > 50:
+                lines.append(f"  ... ({len(branches) - 50} more)")
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        elif name == "latest_correction":
+            node_id = str(arguments.get("node_id", "") or "").strip()
+            branch_id = arguments.get("branch_id")
+            include_chain = bool(arguments.get("include_chain", False))
+            chain_limit_raw = arguments.get("chain_limit", 64)
+            try:
+                chain_limit = max(1, int(chain_limit_raw))
+            except Exception:
+                chain_limit = 64
+
+            result = do_latest_correction(
+                node_id=node_id,
+                branch_id=branch_id,
+                include_chain=include_chain,
+                chain_limit=chain_limit,
+            )
+            if "error" in result:
+                return [TextContent(type="text", text=f"Error: {result['error']}")]
+
+            lines = [
+                " Latest correction resolved",
+                f"  root_node_id: {result.get('root_node_id')}",
+                f"  branch_id: {result.get('branch_id')}",
+                f"  latest_node_id: {result.get('latest_node_id')}",
+                f"  latest_lcm_id: {result.get('latest_lcm_id')}",
+                f"  latest_update_mode: {result.get('latest_update_mode')}",
+                f"  latest_correction_kind: {result.get('latest_correction_kind')}",
+                f"  latest_correction_version: {result.get('latest_correction_version')}",
+                f"  latest_timestamp: {result.get('latest_timestamp')}",
+                f"  chain_length: {result.get('chain_length', 0)}",
+            ]
+            if poll_line:
+                lines.insert(1, poll_line)
+            if include_chain:
+                lines.append(f"  chain_returned: {result.get('chain_returned', 0)} (limit={result.get('chain_limit', chain_limit)})")
+                chain_rows = result.get("chain", []) or []
+                for i, row in enumerate(chain_rows[:40], 1):
+                    lines.append(
+                        f"   {i}. id={row.get('id')} ver={row.get('correction_version')} "
+                        f"kind={row.get('correction_kind')} mode={row.get('update_mode')} ts={row.get('timestamp')}"
+                    )
+                if len(chain_rows) > 40:
+                    lines.append(f"   ... ({len(chain_rows) - 40} more)")
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "sync_lcm_ingest":

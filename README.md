@@ -260,7 +260,9 @@ Useful keys in `geometry_config`:
 - `retrieval_feedback` - record explicit feedback for `hybrid_search` results using `query_id` and `branch_id`
 - `branch_report` - branch diagnostics (state, regime, rank/coherence/anisotropy, etc.)
 - `geometry_stats` - global DB health and distribution stats
-- `maintenance_cycle` - run one maintenance cycle, optionally chunked (`max_branches`) with optional cursor reset
+- `maintenance_cycle` - run one maintenance cycle, optionally chunked (`max_branches`) with optional cursor reset; output includes retrieval-feedback pruning counters (`retrieval_feedback_pruned`, `_age`, `_cap`)
+- `geometry_snapshot` - export compact branch metrics for ops/debug (supports `state`, `branch_ids`, `limit`, optional `include_means`)
+- `latest_correction` - resolve correction lineage and return latest correction node/version for any seed `node_id` (optional chain expansion)
 - `sync_lcm_ingest` - force one incremental ingest poll from `lcm.db` into geometry DB
 - `sync_lcm_dag_edges` - rebuild imported DAG edges (`summarizes`, `derived_from`) and return orphan-validation counters
 - `backfill_lcm_conversations` - targeted backfill for specific LCM conversation IDs with dry-run and resume options

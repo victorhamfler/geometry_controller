@@ -1,8 +1,8 @@
 # LCM Geometry Module - User and Agent Tutorial
 
-**Version:** 1.4
+**Version:** 1.5
 **Module:** `lcm_geometry_controller.py`
-**Last Updated:** 2026-04-09
+**Last Updated:** 2026-04-13
 
 This tutorial explains how to use the geometry module as a semantic companion to OpenClaw LCM.
 
@@ -38,14 +38,16 @@ Current runtime uses inactivity + usefulness policy to move ACTIVE/STABLE/TENSIO
 
 ## 3. MCP tools
 
-Use these 9 tools exposed by `geometry-hybrid`:
+Use these 11 tools exposed by `geometry-hybrid`:
 
 - `geometry-hybrid__hybrid_search`: combined semantic + keyword ranking.
 - `geometry-hybrid__retrieval_feedback`: explicit feedback for a `hybrid_search` result (`query_id`, `branch_id`).
 - `geometry-hybrid__conversation_content`: read summaries/messages for a branch (`conv_*`).
 - `geometry-hybrid__branch_report`: inspect one branch (state/regime/metrics + `update_mode_counts`).
 - `geometry-hybrid__geometry_stats`: global geometry DB health metrics.
-- `geometry-hybrid__maintenance_cycle`: run one maintenance cycle (supports chunking via `max_branches`).
+- `geometry-hybrid__maintenance_cycle`: run one maintenance cycle (supports chunking via `max_branches`) and reports retrieval-feedback pruning counters.
+- `geometry-hybrid__geometry_snapshot`: export compact branch metrics (`state`, `branch_ids`, `limit`, optional `include_means`).
+- `geometry-hybrid__latest_correction`: resolve correction chain and return latest correction for any seed `node_id`.
 - `geometry-hybrid__sync_lcm_ingest`: force one incremental LCM->geometry ingest poll.
 - `geometry-hybrid__sync_lcm_dag_edges`: rebuild imported DAG edges and return orphan-validation counters.
 - `geometry-hybrid__backfill_lcm_conversations`: targeted backfill for specific LCM conversation IDs.
@@ -73,6 +75,15 @@ For `backfill_lcm_conversations`:
 - Use `dry_run=true` for preview mode without embeddings.
 - Real mode (`dry_run=false`) needs an embedding provider.
 - If provider is missing, output shows `provider_ready=false`, `aborted=true`, and `preflight_error`.
+
+`maintenance_cycle` output includes:
+- `retrieval_feedback_pruned`
+- `retrieval_feedback_pruned_age`
+- `retrieval_feedback_pruned_cap`
+
+`latest_correction` supports:
+- `include_chain=true` for ordered chain entries
+- `chain_limit=<N>` to cap returned chain payload
 
 ---
 

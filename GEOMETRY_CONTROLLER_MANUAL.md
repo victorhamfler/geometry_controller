@@ -1,10 +1,10 @@
 ﻿# LCM Geometry Controller â€” Manual
 
-**Version:** 1.5
+**Version:** 1.6
 **Module:** `lcm_geometry_controller.py`
 **Geometry DB:** `<openclaw_home>/lcm_geometry.db`
 **LCM DB:** `<openclaw_home>/lcm.db`
-**Last Updated:** 2026-04-09
+**Last Updated:** 2026-04-13
 
 ---
 
@@ -336,8 +336,19 @@ Full maintenance sweep over all branches. Should be run periodically (every 20â
     'merge_candidates': 0,
     'merge_executed': 1,
     'reactivated': 0,
+    'retrieval_feedback_pruned': 0,
+    'retrieval_feedback_pruned_age': 0,
+    'retrieval_feedback_pruned_cap': 0,
     'split_observations': 437,
-    'split_trace_run_id': '...'
+    'split_trace_run_id': '...',
+    'maintenance_chunking': {
+        'enabled': True,
+        'chunk_size': 50,
+        'selected_branches': 50,
+        'wrapped': False,
+        'cursor_before': 'conv_105',
+        'cursor_after': 'conv_150'
+    }
 }
 ```
 
@@ -710,7 +721,7 @@ Notes:
 
 ## 12. MCP Server Tools
 
-The OpenClaw MCP server (`<openclaw_home>/extensions/geometry-mcp/server.py`) exposes nine tools:
+The OpenClaw MCP server (`<openclaw_home>/extensions/geometry-mcp/server.py`) exposes eleven tools:
 
 ### `geometry-hybrid__hybrid_search`
 
@@ -764,7 +775,44 @@ Run one maintenance cycle manually (supports low-RAM chunking):
 geometry-hybrid__maintenance_cycle(max_branches=50, reset_chunk_cursor=false)
 ```
 
-Returns recompute/split/merge counters and chunk telemetry.
+Returns recompute/split/merge counters, retrieval-feedback pruning counters, and chunk telemetry.
+
+Pruning counters:
+- `retrieval_feedback_pruned`
+- `retrieval_feedback_pruned_age`
+- `retrieval_feedback_pruned_cap`
+
+### `geometry-hybrid__geometry_snapshot`
+
+Export compact branch metrics for ops/debugging.
+
+```
+geometry-hybrid__geometry_snapshot(state="ACTIVE", limit=20, include_means=false)
+```
+
+Supports:
+- `branch_ids=["conv_148","day_2026-04-07"]` for explicit selection
+- `state="ACTIVE" | "STABLE" | "COLLAPSING" | "ALL"` filter
+- `limit` row cap
+- `include_means=true` to include full branch mean vectors
+
+### `geometry-hybrid__latest_correction`
+
+Resolve correction lineage and return the latest correction node/version for any seed node id.
+
+```
+geometry-hybrid__latest_correction(
+  node_id="c5dff34c-61b3-4296-9af5-84c9a73af4e6",
+  include_chain=true,
+  chain_limit=10
+)
+```
+
+Returns:
+- `root_node_id`, `branch_id`
+- latest correction metadata (`latest_node_id`, `latest_lcm_id`, `latest_update_mode`, `latest_correction_kind`, `latest_correction_version`)
+- `chain_length`
+- optional ordered `chain` payload when `include_chain=true`
 
 ### `geometry-hybrid__sync_lcm_ingest`
 
