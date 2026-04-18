@@ -30,6 +30,8 @@ import sqlite3
 import time
 import threading
 import traceback
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -586,8 +588,12 @@ CREATE INDEX IF NOT EXISTS idx_daily_log_created_ts ON daily_log_content(created
 
 class EmbeddingProvider:
     """
-    Pluggable embedding backend. Supports sentence-transformers (local)
-    or any OpenAI-compatible API.
+    Pluggable embedding backend.
+
+    Supported backends:
+      - sentence_transformers (default): HuggingFace sentence-transformers
+      - llama_cpp / gguf: llama-cpp-python loading a local GGUF embedding model
+      - http: OpenAI-compatible /embeddings endpoint (or custom embedding JSON)
 
     Thread-safe model loading via double-checked locking.
     In-memory LRU cache avoids re-encoding repeated texts.
@@ -598,30 +604,59 @@ class EmbeddingProvider:
         model_name: str = "all-MiniLM-L6-v2",
         device: str = "cpu",
         cache: Optional[dict] = None,
+        backend: str = "sentence_transformers",
+        gguf_model_path: Optional[str] = None,
+        gguf_n_ctx: int = 2048,
+        gguf_n_threads: Optional[int] = None,
+        http_url: Optional[str] = None,
+        http_timeout_sec: float = 30.0,
+        http_headers: Optional[dict[str, str]] = None,
+        normalize_embeddings: bool = True,
+        max_text_chars: int = 1000,
     ):
         self.model_name = model_name
         self.device = device
+        self.backend = self._normalize_backend(backend)
+        self.gguf_model_path = str(gguf_model_path).strip() if gguf_model_path else None
+        self.gguf_n_ctx = max(256, int(gguf_n_ctx))
+        self.gguf_n_threads = int(gguf_n_threads) if gguf_n_threads is not None else None
+        self.http_url = str(http_url or "").strip() or None
+        self.http_timeout_sec = max(1.0, float(http_timeout_sec))
+        self.http_headers = dict(http_headers or {})
+        self.normalize_embeddings = bool(normalize_embeddings)
+        self.max_text_chars = max(32, int(max_text_chars))
         self._model = None
         self._lock = threading.Lock()
         self._cache: dict[str, list[float]] = cache or {}
+        self._embedding_dim_cache: Optional[int] = None
 
     # ---- public API ----
 
     def embed(self, text: str) -> list[float]:
         """Encode a single text. Result is cached keyed by text[:200]."""
-        key = text[:200]
+        safe_text = str(text or "")
+        key = f"{self.backend}:{self.model_name}:{safe_text[:200]}"
         if key in self._cache:
             return self._cache[key]
         self._load()
-        # Truncate to 1000 chars to avoid embedding of very long texts
-        vec = self._model.encode(
-            [text[:1000]],
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )[0]
-        result = vec.tolist()
+        payload = [safe_text[:self.max_text_chars]]
+        if self.backend == "sentence_transformers":
+            vec = self._model.encode(
+                payload,
+                normalize_embeddings=self.normalize_embeddings,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )[0]
+            result = np.array(vec, dtype=np.float32).tolist()
+        elif self.backend == "llama_cpp":
+            result = self._llama_embed_batch(payload)[0]
+        elif self.backend == "http":
+            result = self._http_embed_batch(payload)[0]
+        else:
+            raise RuntimeError(f"Unsupported embedding backend: {self.backend}")
         self._cache[key] = result
+        if self._embedding_dim_cache is None:
+            self._embedding_dim_cache = len(result)
         return result
 
     def embed_batch(self, texts: list[str], batch_size: int = 64) -> list[list[float]]:
@@ -629,23 +664,170 @@ class EmbeddingProvider:
         if not texts:
             return []
         self._load()
-        truncated = [t[:1000] for t in texts]
-        vecs = self._model.encode(
-            truncated,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            batch_size=batch_size,
-            convert_to_numpy=True,
-        )
-        return [v.tolist() for v in vecs]
+        truncated = [str(t or "")[:self.max_text_chars] for t in texts]
+        if self.backend == "sentence_transformers":
+            vecs = self._model.encode(
+                truncated,
+                normalize_embeddings=self.normalize_embeddings,
+                show_progress_bar=False,
+                batch_size=max(1, int(batch_size)),
+                convert_to_numpy=True,
+            )
+            rows = [np.array(v, dtype=np.float32).tolist() for v in vecs]
+        elif self.backend == "llama_cpp":
+            rows = self._llama_embed_batch(truncated)
+        elif self.backend == "http":
+            rows = self._http_embed_batch(truncated)
+        else:
+            raise RuntimeError(f"Unsupported embedding backend: {self.backend}")
+        if self._embedding_dim_cache is None and rows:
+            self._embedding_dim_cache = len(rows[0])
+        return rows
 
     @property
     def embedding_dim(self) -> int:
         """Lazily return model embedding dimension."""
+        if self._embedding_dim_cache is not None:
+            return int(self._embedding_dim_cache)
         self._load()
-        return self._model.get_sentence_embedding_dimension()
+        if self.backend == "sentence_transformers":
+            self._embedding_dim_cache = int(self._model.get_sentence_embedding_dimension())
+            return int(self._embedding_dim_cache)
+        if self.backend in ("llama_cpp", "http"):
+            probe = self.embed("embedding-dim-probe")
+            self._embedding_dim_cache = len(probe)
+            return int(self._embedding_dim_cache)
+        raise RuntimeError(f"Unsupported embedding backend: {self.backend}")
+
+    def descriptor(self) -> dict[str, Any]:
+        """Lightweight backend/model identity for runtime diagnostics + DB guard."""
+        return {
+            "backend": self.backend,
+            "model_name": str(self.model_name or ""),
+            "device": str(self.device or ""),
+            "gguf_model_path": self._resolve_gguf_model_path() if self.backend == "llama_cpp" else None,
+            "http_url": self.http_url if self.backend == "http" else None,
+            "embedding_dim": self.embedding_dim,
+        }
 
     # ---- internal ----
+
+    @staticmethod
+    def _normalize_backend(raw: str) -> str:
+        token = str(raw or "").strip().lower().replace("-", "_")
+        if token in ("", "sentence_transformers", "sentence_transformer", "st"):
+            return "sentence_transformers"
+        if token in ("llama_cpp", "gguf", "llama"):
+            return "llama_cpp"
+        if token in ("http", "api", "openai"):
+            return "http"
+        return token
+
+    def _resolve_gguf_model_path(self) -> str:
+        if self.gguf_model_path:
+            return os.path.abspath(os.path.expanduser(self.gguf_model_path))
+        name = str(self.model_name or "").strip()
+        if name.lower().endswith(".gguf"):
+            return os.path.abspath(os.path.expanduser(name))
+        raise ValueError(
+            "GGUF backend requires gguf_model_path or model_name ending with .gguf"
+        )
+
+    def _normalize_vector(self, row: Any) -> list[float]:
+        arr = np.array(row, dtype=np.float32).reshape(-1)
+        if self.normalize_embeddings:
+            nrm = float(np.linalg.norm(arr))
+            if nrm > 1e-12:
+                arr = arr / nrm
+        return arr.tolist()
+
+    def _llama_embed_batch(self, texts: list[str]) -> list[list[float]]:
+        rows: list[list[float]] = []
+        if hasattr(self._model, "embed"):
+            try:
+                raw = self._model.embed(texts)
+                if isinstance(raw, list) and len(raw) == len(texts):
+                    return [self._normalize_vector(v) for v in raw]
+            except Exception:
+                # fall back to create_embedding path
+                pass
+        if hasattr(self._model, "create_embedding"):
+            # Prefer batched call first. Some llama.cpp builds/models can fail on
+            # multi-sequence embedding decode; then fall back to single-item calls.
+            try:
+                resp = self._model.create_embedding(texts if len(texts) > 1 else texts[0])
+                data = resp.get("data") if isinstance(resp, dict) else None
+                if isinstance(data, list):
+                    for row in data:
+                        emb = row.get("embedding") if isinstance(row, dict) else None
+                        if emb is None:
+                            raise RuntimeError("llama_cpp.create_embedding returned invalid row")
+                        rows.append(self._normalize_vector(emb))
+                    if len(rows) == len(texts):
+                        return rows
+            except Exception:
+                rows = []
+                for text in texts:
+                    resp = self._model.create_embedding(text)
+                    data = resp.get("data") if isinstance(resp, dict) else None
+                    if not isinstance(data, list) or not data:
+                        raise RuntimeError("llama_cpp.create_embedding returned invalid response")
+                    row0 = data[0]
+                    emb = row0.get("embedding") if isinstance(row0, dict) else None
+                    if emb is None:
+                        raise RuntimeError("llama_cpp.create_embedding returned invalid row")
+                    rows.append(self._normalize_vector(emb))
+                if len(rows) == len(texts):
+                    return rows
+        raise RuntimeError("Unable to obtain embeddings from llama_cpp backend")
+    def _http_embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if not self.http_url:
+            raise ValueError("HTTP embedding backend requires http_url")
+        url = self.http_url.rstrip("/")
+        if not url.endswith("/embeddings"):
+            url = f"{url}/embeddings"
+        payload = {
+            "input": texts,
+            "model": self.model_name,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            **self.http_headers,
+        }
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=self.http_timeout_sec) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP embedding request failed: {exc.code} {detail}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"HTTP embedding request failed: {exc}") from exc
+        try:
+            obj = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            raise RuntimeError(f"HTTP embedding response is not valid JSON: {exc}") from exc
+
+        # OpenAI-compatible shape
+        if isinstance(obj, dict) and isinstance(obj.get("data"), list):
+            rows: list[list[float]] = []
+            for row in obj["data"]:
+                emb = row.get("embedding") if isinstance(row, dict) else None
+                if emb is None:
+                    raise RuntimeError("HTTP embedding response missing data[].embedding")
+                rows.append(self._normalize_vector(emb))
+            if len(rows) == len(texts):
+                return rows
+
+        # Custom light shape: {"embeddings":[...]}
+        if isinstance(obj, dict) and isinstance(obj.get("embeddings"), list):
+            rows = [self._normalize_vector(v) for v in obj["embeddings"]]
+            if len(rows) == len(texts):
+                return rows
+
+        raise RuntimeError("HTTP embedding response does not match expected schema")
 
     def _load(self):
         """Thread-safe lazy model loading (double-checked locking)."""
@@ -653,8 +835,25 @@ class EmbeddingProvider:
             return
         with self._lock:
             if self._model is None:
-                from sentence_transformers import SentenceTransformer
-                self._model = SentenceTransformer(self.model_name, device=self.device)
+                if self.backend == "sentence_transformers":
+                    from sentence_transformers import SentenceTransformer
+                    self._model = SentenceTransformer(self.model_name, device=self.device)
+                elif self.backend == "llama_cpp":
+                    from llama_cpp import Llama
+                    model_path = self._resolve_gguf_model_path()
+                    kwargs: dict[str, Any] = {
+                        "model_path": model_path,
+                        "embedding": True,
+                        "n_ctx": self.gguf_n_ctx,
+                    }
+                    if self.gguf_n_threads is not None and self.gguf_n_threads > 0:
+                        kwargs["n_threads"] = self.gguf_n_threads
+                    self._model = Llama(**kwargs)
+                elif self.backend == "http":
+                    # No local model object needed; requests are sent per call.
+                    self._model = object()
+                else:
+                    raise ValueError(f"Unknown embedding backend: {self.backend}")
 
 
 
@@ -2503,9 +2702,68 @@ class GeometryController:
         self.regime            = RegimeClassifier(self.cfg)
         self.embedding_provider = embedding_provider  # may be None
         self.db.connect()
+        self._enforce_embedding_runtime_signature()
         self._poll_lock        = threading.Lock()
         self._topic_drift_content_len_cache: dict[str, int] = {}
         self._topic_drift_content_lookup_failed: bool = False
+
+    def _build_embedding_runtime_signature(self) -> Optional[dict[str, Any]]:
+        if self.embedding_provider is None:
+            return None
+        descriptor = self.embedding_provider.descriptor()
+        provider_dim = int(descriptor.get("embedding_dim") or 0)
+        cfg_dim = int(self.cfg.embedding_dim)
+        if provider_dim <= 0:
+            raise ValueError("Embedding provider returned invalid embedding dimension")
+        if provider_dim != cfg_dim:
+            raise ValueError(
+                f"Embedding dimension mismatch: provider={provider_dim} cfg.embedding_dim={cfg_dim}"
+            )
+        return {
+            "signature_version": 1,
+            "backend": str(descriptor.get("backend") or "unknown"),
+            "model_name": str(descriptor.get("model_name") or ""),
+            "embedding_dim": provider_dim,
+            "gguf_model_path": descriptor.get("gguf_model_path"),
+            "http_url": descriptor.get("http_url"),
+            "device": str(descriptor.get("device") or ""),
+            "updated_ts": time.time(),
+        }
+
+    def _enforce_embedding_runtime_signature(self) -> None:
+        sig = self._build_embedding_runtime_signature()
+        if not sig:
+            return
+
+        key = "embedding_runtime_signature_v1"
+        current_text = json.dumps(sig, sort_keys=True, ensure_ascii=False)
+        existing_raw = self.db.get_maintenance_state(key)
+        if not existing_raw:
+            self.db.set_maintenance_state(key, current_text)
+            return
+
+        try:
+            existing = json.loads(existing_raw)
+            if not isinstance(existing, dict):
+                existing = {}
+        except Exception:
+            existing = {}
+
+        fields = ("backend", "model_name", "embedding_dim", "gguf_model_path", "http_url")
+        mismatch = any(existing.get(f) != sig.get(f) for f in fields)
+        if not mismatch:
+            return
+
+        allow_change = str(os.getenv("GEOMETRY_ALLOW_EMBEDDING_SIGNATURE_CHANGE", "")).strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if not allow_change:
+            raise ValueError(
+                "Embedding runtime signature mismatch detected. "
+                "Refusing to mix embeddings from different backends/models in the same geometry DB. "
+                "Use a fresh DB or set GEOMETRY_ALLOW_EMBEDDING_SIGNATURE_CHANGE=1 to override."
+            )
+        self.db.set_maintenance_state(key, current_text)
 
     def _branch_stats_from_scalar_row(self, row: dict[str, Any]) -> BranchStats:
         try:
@@ -5188,7 +5446,7 @@ class GeometryController:
 
 def create_geometry_controller(
     db_path:            str = "lcm_geometry.db",
-    embedding_dim:       int = 384,
+    embedding_dim:       Optional[int] = None,
     embedding_provider = None,   # Optional[EmbeddingProvider]
     **cfg_overrides:    Any,
 ) -> GeometryController:
@@ -5223,7 +5481,17 @@ def create_geometry_controller(
             token_count=6,
         )
     """
-    cfg = GeometryConfig(embedding_dim=embedding_dim, **cfg_overrides)
+    resolved_dim: int
+    if embedding_dim is not None:
+        resolved_dim = int(embedding_dim)
+    elif embedding_provider is not None:
+        try:
+            resolved_dim = int(embedding_provider.embedding_dim)
+        except Exception:
+            resolved_dim = 384
+    else:
+        resolved_dim = 384
+    cfg = GeometryConfig(embedding_dim=resolved_dim, **cfg_overrides)
     return GeometryController(db_path, cfg, embedding_provider=embedding_provider)
 
 

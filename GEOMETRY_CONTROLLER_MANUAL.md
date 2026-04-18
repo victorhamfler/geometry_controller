@@ -1,4 +1,4 @@
-﻿# LCM Geometry Controller â€” Manual
+# LCM Geometry Controller â€” Manual
 
 **Version:** 1.6
 **Module:** `lcm_geometry_controller.py`
@@ -485,15 +485,26 @@ Compatibility notes:
 
 ## 7. EmbeddingProvider
 
-Pluggable embedding backend. Supports sentence-transformers (local) or any OpenAI-compatible API.
+Pluggable embedding backend.
+
+Supported backends:
+- `sentence_transformers` (default)
+- `llama_cpp` / GGUF (`llama-cpp-python`)
+- `http` (OpenAI-compatible `/embeddings` endpoint)
 
 ### Init
 
 ```python
 EmbeddingProvider(
-    model_name="all-MiniLM-L6-v2",  # HuggingFace model name
-    device="cpu",                     # or "cuda"
-    cache=None,                       # optional shared dict cache
+    model_name="all-MiniLM-L6-v2",
+    device="cpu",
+    backend="sentence_transformers",
+    gguf_model_path=None,      # required for llama_cpp unless model_name endswith .gguf
+    gguf_n_ctx=2048,
+    gguf_n_threads=None,
+    http_url=None,             # required for http backend
+    http_timeout_sec=30.0,
+    cache=None,
 )
 ```
 
@@ -504,6 +515,8 @@ EmbeddingProvider(
 **`ep.embed_batch(texts, batch_size=64)`** â€” Encode list of texts. No caching.
 
 **`ep.embedding_dim`** â€” Lazy property returning model's embedding dimension.
+
+**`ep.descriptor()`** â€” Runtime signature fields (`backend`, `model_name`, `embedding_dim`, backend-specific connection info).
 
 ### Integration with GeometryController
 
@@ -521,6 +534,14 @@ gc.on_new_item(lcm_id="msg_1", node_type=NodeType.MESSAGE,
 ```
 
 The `EmbeddingProvider` is lazy â€” the model is only loaded on first `embed()` call, not at init.
+
+### Runtime signature guard
+
+`GeometryController` enforces a persisted embedding runtime signature:
+
+- compares backend/model/dimension against prior DB runtime signature
+- blocks startup on mismatch to prevent mixed embedding spaces in one DB
+- override only when intentional: `GEOMETRY_ALLOW_EMBEDDING_SIGNATURE_CHANGE=1`
 
 ---
 
@@ -907,9 +928,21 @@ cp <module_repo_root>/extensions/geometry-mcp/runtime_config.example.json \
 ```
 2. Edit `runtime_config.json`:
    - top-level `polling` section for real-time ingest
+     - `polling.auto_tools` defines which tools trigger auto-poll (default `["hybrid_search"]`)
+     - `polling.auto_limit` caps auto-poll ingest size for low-latency tool calls (default `3` on GGUF)
+   - top-level `startup` section for warmup behavior
+     - `startup.warmup_gc` enables background warmup at server startup
+     - `startup.warmup_probe_embed` defaults to disabled for GGUF to avoid startup contention
+   - top-level `embedding` section for backend/model runtime (`sentence_transformers`, `llama_cpp`, `http`)
    - `geometry_config` section for controller policy tuning
 3. Restart gateway.  
 The server also supports env override `GEOMETRY_RUNTIME_CONFIG_JSON` (JSON object).
+
+EmbeddingGemma GGUF cutover assets:
+
+- Runbook: `GEOMETRY_GGUF_MIGRATION_RUNBOOK.md`
+- Ready config template: `extensions/geometry-mcp/runtime_config.embeddinggemma_gguf.example.json`
+- Use `dim=768` for `embeddinggemma-300m` variants.
 
 ---
 

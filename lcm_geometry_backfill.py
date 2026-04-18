@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LCM Geometry Backfill - Full DB with sentence-transformers embeddings
+LCM Geometry Backfill - Full DB with pluggable embedding backend
 Run: python3 lcm_geometry_backfill.py (optionally set OPENCLAW_HOME and GEOMETRY_MODULE_HOME)
 """
 import sqlite3, time, tempfile, os, sys, numpy as np, json, shutil, random
@@ -17,9 +17,9 @@ sys.path.insert(0, str(MODULE_HOME))
 
 from lcm_geometry_controller import (
     GeometryController, GeometryConfig, NodeType, create_geometry_controller,
-    BranchState, GeometricRegime, BranchStats, MemoryNode, GeometryMath
+    BranchState, GeometricRegime, BranchStats, MemoryNode, GeometryMath,
+    EmbeddingProvider,
 )
-from sentence_transformers import SentenceTransformer
 
 OUTPUT_DB = str(OPENCLAW_HOME / 'lcm_geometry.db')
 PROGRESS_FILE = str(MODULE_HOME / 'backfill_progress.json')
@@ -38,12 +38,33 @@ def log(msg):
     with open(LOG_FILE, 'a') as f:
         f.write(line + '\n')
 
-DIM = 384
+EMBED_BACKEND = str(os.environ.get("GEOMETRY_EMBED_BACKEND", "sentence_transformers") or "sentence_transformers")
+EMBED_MODEL_NAME = str(os.environ.get("GEOMETRY_EMBED_MODEL", "all-MiniLM-L6-v2") or "all-MiniLM-L6-v2")
+EMBED_DEVICE = str(os.environ.get("GEOMETRY_EMBED_DEVICE", "cpu") or "cpu")
+EMBED_GGUF_PATH = str(os.environ.get("GEOMETRY_EMBED_GGUF_PATH", "") or "").strip() or None
+EMBED_GGUF_N_CTX = int(os.environ.get("GEOMETRY_EMBED_GGUF_N_CTX", "2048") or "2048")
+_threads_raw = str(os.environ.get("GEOMETRY_EMBED_GGUF_N_THREADS", "") or "").strip()
+EMBED_GGUF_N_THREADS = int(_threads_raw) if _threads_raw else None
+EMBED_HTTP_URL = str(os.environ.get("GEOMETRY_EMBED_HTTP_URL", "") or "").strip() or None
+EMBED_HTTP_TIMEOUT_SEC = float(os.environ.get("GEOMETRY_EMBED_HTTP_TIMEOUT_SEC", "30") or "30")
 
 log("Loading model...")
 t0 = time.time()
-model = SentenceTransformer('all-MiniLM-L6-v2')
-log(f"Model loaded in {time.time()-t0:.1f}s | dim={DIM}")
+provider = EmbeddingProvider(
+    model_name=EMBED_MODEL_NAME,
+    device=EMBED_DEVICE,
+    backend=EMBED_BACKEND,
+    gguf_model_path=EMBED_GGUF_PATH,
+    gguf_n_ctx=EMBED_GGUF_N_CTX,
+    gguf_n_threads=EMBED_GGUF_N_THREADS,
+    http_url=EMBED_HTTP_URL,
+    http_timeout_sec=EMBED_HTTP_TIMEOUT_SEC,
+)
+DIM = int(provider.embedding_dim)
+log(
+    f"Embedding provider loaded in {time.time()-t0:.1f}s | "
+    f"backend={provider.backend} model={provider.model_name} dim={DIM}"
+)
 
 log("Loading LCM data...")
 lcm_conn = sqlite3.connect(LCM_DB)
@@ -102,8 +123,10 @@ for ci, conv_id in enumerate(convs):
         work_msgs = [msgs[i] for i in indices]
 
     texts = [m['content'] for m in work_msgs]
-    embs = model.encode(texts, convert_to_numpy=True, show_progress_bar=False,
-                        batch_size=64, normalize_embeddings=True)
+    embs = np.array(
+        provider.embed_batch(texts, batch_size=64),
+        dtype=np.float32,
+    )
 
     weights = np.ones(len(embs), dtype=np.float32)
     mu = GeometryMath.weighted_mean(embs.astype(np.float32), weights)
@@ -122,9 +145,10 @@ for ci, conv_id in enumerate(convs):
 
     if sums:
         sum_texts = [s['content'] for s in sums]
-        sum_embs_raw = model.encode(sum_texts, convert_to_numpy=True,
-                                    show_progress_bar=False, batch_size=64,
-                                    normalize_embeddings=True)
+        sum_embs_raw = np.array(
+            provider.embed_batch(sum_texts, batch_size=64),
+            dtype=np.float32,
+        )
         for si, s in enumerate(sums):
             se = sum_embs_raw[si].astype(np.float32)
             se_blend = (0.7 * se + 0.3 * mu.astype(np.float32)).astype(np.float32)
@@ -142,7 +166,7 @@ log("Writing geometry DB...")
 t0 = time.time()
 with tempfile.TemporaryDirectory() as td:
     tmp_db = os.path.join(td, 'lcm_geometry.db')
-    gc = create_geometry_controller(tmp_db, embedding_dim=DIM)
+    gc = create_geometry_controller(tmp_db, embedding_provider=provider)
     for bs in all_bs:
         gc.db.upsert_branch(bs)
     for mn in all_mn:
@@ -150,7 +174,12 @@ with tempfile.TemporaryDirectory() as td:
     log(f"  Inserted {len(all_bs)} branches + {len(all_mn)} nodes")
     counts = gc.run_maintenance_cycle()
     log(f"  Maintenance: {counts}")
-    shutil.copy(tmp_db, OUTPUT_DB)
+    # Export with SQLite backup API to avoid WAL-copy corruption.
+    out_conn = sqlite3.connect(OUTPUT_DB)
+    try:
+        gc.db.conn.backup(out_conn)
+    finally:
+        out_conn.close()
 
 sz = os.path.getsize(OUTPUT_DB) / 1024
 all_b = gc.db.all_branches()

@@ -21,10 +21,18 @@ fi
 
 "${PYTHON_BIN}" -m pip install --upgrade pip >/dev/null
 
-if ! "${PYTHON_BIN}" -c "import torch, sentence_transformers" >/dev/null 2>&1; then
-  echo "[setup] installing CPU torch + sentence-transformers"
-  "${PIP_BIN}" install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-  "${PIP_BIN}" install --no-cache-dir sentence-transformers
+EMBED_BACKEND="${GEOMETRY_EMBED_BACKEND:-sentence_transformers}"
+if [[ "${EMBED_BACKEND}" == "llama_cpp" || "${EMBED_BACKEND}" == "gguf" ]]; then
+  if ! "${PYTHON_BIN}" -c "import llama_cpp" >/dev/null 2>&1; then
+    echo "[setup] installing llama-cpp-python for GGUF embeddings"
+    "${PIP_BIN}" install --no-cache-dir llama-cpp-python
+  fi
+else
+  if ! "${PYTHON_BIN}" -c "import torch, sentence_transformers" >/dev/null 2>&1; then
+    echo "[setup] installing CPU torch + sentence-transformers"
+    "${PIP_BIN}" install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+    "${PIP_BIN}" install --no-cache-dir sentence-transformers
+  fi
 fi
 
 exec "${PYTHON_BIN}" "${REPO_ROOT}/scripts/run_ml_split_regression.py" "$@"

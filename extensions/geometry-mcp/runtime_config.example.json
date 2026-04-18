@@ -2,14 +2,32 @@
   "geo_db": "<openclaw_home>/lcm_geometry.db",
   "lcm_db": "<openclaw_home>/lcm.db",
   "embedding_model": "all-MiniLM-L6-v2",
+  "embedding": {
+    "backend": "sentence_transformers",
+    "model": "all-MiniLM-L6-v2",
+    "device": "cpu",
+    "dim": 384,
+    "gguf_path": "",
+    "gguf_n_ctx": 2048,
+    "gguf_n_threads": null,
+    "http_url": "",
+    "http_timeout_sec": 30
+  },
   "polling": {
     "enabled": true,
     "interval_seconds": 8,
     "limit": 200,
+    "auto_limit": 3,
+    "auto_tools": ["hybrid_search"],
     "conversation_id": null,
     "cursor_path": "<openclaw_home>/extensions/geometry-mcp/poll_cursor.json",
     "show_status": true,
     "debug_log": false
+  },
+  "startup": {
+    "warmup_gc": true,
+    "warmup_probe_embed": false,
+    "warmup_query": "geometry-mcp-warmup"
   },
   "geometry_config": {
     "retrieval_prefilter_limit": 256,

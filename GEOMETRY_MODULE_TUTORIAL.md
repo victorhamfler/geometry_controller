@@ -15,7 +15,8 @@ LCM keyword search and geometry semantic search are complementary:
 1. `lcm.db` stores raw messages/summaries (source of truth).
 2. `lcm_geometry.db` stores branch geometry, lifecycle/regime signals, and retrieval metadata.
 
-The geometry layer uses embeddings (default 384-dim, `all-MiniLM-L6-v2`) to find related context even when exact keywords differ.
+The geometry layer uses embeddings (default 384-dim, `all-MiniLM-L6-v2`) to find related context even when exact keywords differ.  
+Current runtime also supports GGUF embedding models (for example Gemma 300M) via `embedding.backend = "llama_cpp"` in `runtime_config.json`.
 
 ---
 
@@ -141,7 +142,12 @@ For `backfill_lcm_conversations`:
 | `polling.enabled` *(top-level)* | `true` | Enable automatic incremental ingest on tool calls |
 | `polling.interval_seconds` *(top-level)* | `8` | Cooldown between automatic ingest polls |
 | `polling.limit` *(top-level)* | `200` | Max messages ingested per poll |
+| `polling.auto_limit` *(top-level)* | `3` *(GGUF default)* | Max rows for lightweight auto-poll path (`hybrid_search`) |
+| `polling.auto_tools` *(top-level)* | `["hybrid_search"]` | Tools that trigger auto-poll before execution |
 | `polling.cursor_path` *(top-level)* | `<openclaw_home>/.../poll_cursor.json` | Persistent rowid cursor path |
+| `startup.warmup_gc` *(top-level)* | `true` | Start GC/model warmup in background at MCP startup |
+| `startup.warmup_probe_embed` *(top-level)* | `false` *(GGUF default)* | Optional embed probe during warmup (disable for lower startup contention) |
+| `startup.warmup_query` *(top-level)* | `"geometry-mcp-warmup"` | Probe text used when warmup probe is enabled |
 | `split_child_copy_usefulness` | `true` | Split children inherit parent usefulness |
 | `split_child_anchor_from_centroid` | `true` | Split children seed anchor from cluster centroid |
 
@@ -171,6 +177,11 @@ openclaw gateway restart
 The MCP server loads:
 - `<openclaw_home>/extensions/geometry-mcp/runtime_config.json`
 - optional env override `GEOMETRY_RUNTIME_CONFIG_JSON` (JSON object)
+
+Operational note:
+- With current defaults, read-only tools like `geometry_stats` do not trigger heavy auto-poll ingest.
+- Server stderr now includes per-tool timing diagnostics:
+  - `[geometry-mcp] tool=<name> dur_ms=<ms> poll=<state> warmup_running=<bool>`
 
 ### Verify module
 

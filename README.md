@@ -2,7 +2,18 @@
 
 Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geometry-aware tools.
 
-## Latest Update (2026-04-12)
+## Latest Update (2026-04-18)
+
+- MCP timeout/stability hardening for GGUF backends:
+  - auto-poll is now tool-scoped (`polling.auto_tools`, default `["hybrid_search"]`)
+  - auto-poll uses independent low cap (`polling.auto_limit`, default `3` for `llama_cpp`)
+  - auto-poll skips while startup warmup is running (`skipped=warming_up`)
+  - `geometry_stats` avoids blocking on GC init during warmup and returns DB scalars fast
+  - startup warmup probe defaults to off for `llama_cpp` (`startup.warmup_probe_embed=false`)
+  - per-call timing diagnostics added in server stderr:
+    - `[geometry-mcp] tool=<name> dur_ms=<ms> poll=<state> warmup_running=<bool>`
+
+## Previous Update (2026-04-12)
 
 - Added scalar/lazy branch loading paths:
   - retrieval prefilter by branch scalars (`retrieval_prefilter_limit`)
@@ -190,10 +201,49 @@ Top-level runtime block (outside `geometry_config`):
 - `polling.enabled`
 - `polling.interval_seconds`
 - `polling.limit`
+- `polling.auto_limit` (lightweight auto-poll cap used for auto-poll tools)
+- `polling.auto_tools` (list of tool names that trigger auto-poll; default `["hybrid_search"]`)
 - `polling.conversation_id`
 - `polling.cursor_path`
 - `polling.show_status`
 - `polling.debug_log`
+- `startup.warmup_gc`
+- `startup.warmup_probe_embed`
+- `startup.warmup_query`
+
+Embedding runtime block:
+
+- `embedding.backend` = `sentence_transformers | llama_cpp | http`
+- `embedding.model`
+- `embedding.device` (for sentence-transformers)
+- `embedding.dim` (default `384`)
+- `embedding.gguf_path`, `embedding.gguf_n_ctx`, `embedding.gguf_n_threads` (for GGUF)
+- `embedding.http_url`, `embedding.http_timeout_sec` (for HTTP backend)
+
+Gemma 300M GGUF example:
+
+```json
+{
+  "embedding": {
+    "backend": "llama_cpp",
+    "model": "embedding-gemma-300M-Q8_0.gguf",
+    "gguf_path": "/home/victo/models/embedding-gemma-300M-Q8_0.gguf",
+    "dim": 768
+  }
+}
+```
+
+Production cutover runbook:
+
+- [`GEOMETRY_GGUF_MIGRATION_RUNBOOK.md`](./GEOMETRY_GGUF_MIGRATION_RUNBOOK.md)
+- ready config template:
+  `extensions/geometry-mcp/runtime_config.embeddinggemma_gguf.example.json`
+
+Safety guard:
+
+- Controller persists an embedding runtime signature in `maintenance_state`.
+- If backend/model/dimension changes on an existing `lcm_geometry.db`, startup fails by default to prevent mixed-vector corruption.
+- To intentionally migrate in-place, set `GEOMETRY_ALLOW_EMBEDDING_SIGNATURE_CHANGE=1` (recommended only after controlled migration/rebuild).
 
 Useful keys in `geometry_config`:
 

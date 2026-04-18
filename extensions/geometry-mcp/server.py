@@ -80,7 +80,44 @@ _RUNTIME_CFG = _load_runtime_config()
 _PATHS_CFG = _RUNTIME_CFG.get("paths", {}) if isinstance(_RUNTIME_CFG.get("paths"), dict) else {}
 GEO_DB = str(_PATHS_CFG.get("geo_db") or _RUNTIME_CFG.get("geo_db") or DEFAULT_GEO_DB)
 LCM_DB = str(_PATHS_CFG.get("lcm_db") or _RUNTIME_CFG.get("lcm_db") or DEFAULT_LCM_DB)
-EMBED_MODEL_NAME = str(_RUNTIME_CFG.get("embedding_model") or "all-MiniLM-L6-v2")
+_EMBED_CFG = _RUNTIME_CFG.get("embedding", {}) if isinstance(_RUNTIME_CFG.get("embedding"), dict) else {}
+EMBED_MODEL_NAME = str(
+    _EMBED_CFG.get("model")
+    or _RUNTIME_CFG.get("embedding_model")
+    or "all-MiniLM-L6-v2"
+)
+_backend_raw = str(
+    _EMBED_CFG.get("backend")
+    or _RUNTIME_CFG.get("embedding_backend")
+    or ""
+).strip().lower().replace("-", "_")
+if not _backend_raw:
+    _backend_raw = "llama_cpp" if EMBED_MODEL_NAME.lower().endswith(".gguf") else "sentence_transformers"
+if _backend_raw in ("st", "sentence_transformer"):
+    _backend_raw = "sentence_transformers"
+if _backend_raw in ("gguf", "llama"):
+    _backend_raw = "llama_cpp"
+EMBED_BACKEND = _backend_raw
+EMBED_DEVICE = str(_EMBED_CFG.get("device") or os.getenv("GEOMETRY_EMBED_DEVICE", "cpu") or "cpu")
+EMBED_DIM = int(_EMBED_CFG.get("dim") or _RUNTIME_CFG.get("embedding_dim") or 384)
+EMBED_GGUF_PATH = str(
+    _EMBED_CFG.get("gguf_path")
+    or _RUNTIME_CFG.get("embedding_gguf_path")
+    or ""
+).strip() or None
+EMBED_GGUF_N_CTX = int(_EMBED_CFG.get("gguf_n_ctx") or _RUNTIME_CFG.get("embedding_gguf_n_ctx") or 2048)
+_threads_raw = _EMBED_CFG.get("gguf_n_threads", _RUNTIME_CFG.get("embedding_gguf_n_threads"))
+EMBED_GGUF_N_THREADS = int(_threads_raw) if _threads_raw is not None else None
+EMBED_HTTP_URL = str(
+    _EMBED_CFG.get("http_url")
+    or _RUNTIME_CFG.get("embedding_http_url")
+    or ""
+).strip() or None
+EMBED_HTTP_TIMEOUT_SEC = float(
+    _EMBED_CFG.get("http_timeout_sec")
+    or _RUNTIME_CFG.get("embedding_http_timeout_sec")
+    or 30.0
+)
 _GEOMETRY_CFG_OVERRIDES = _RUNTIME_CFG.get("geometry_config", {})
 if not isinstance(_GEOMETRY_CFG_OVERRIDES, dict):
     _GEOMETRY_CFG_OVERRIDES = {}
@@ -91,57 +128,161 @@ if not isinstance(_POLLING_CFG, dict):
 POLLING_ENABLED = bool(_POLLING_CFG.get("enabled", True))
 POLLING_INTERVAL_SEC = float(_POLLING_CFG.get("interval_seconds", 8.0))
 POLLING_LIMIT = int(_POLLING_CFG.get("limit", 200))
+_auto_limit_default = 3 if EMBED_BACKEND == "llama_cpp" else POLLING_LIMIT
+try:
+    POLLING_AUTO_LIMIT = max(1, int(_POLLING_CFG.get("auto_limit", _auto_limit_default)))
+except Exception:
+    POLLING_AUTO_LIMIT = max(1, int(_auto_limit_default))
+_auto_tools_raw = _POLLING_CFG.get("auto_tools")
+if isinstance(_auto_tools_raw, (list, tuple, set)):
+    AUTO_POLL_TOOLS = {str(x).strip() for x in _auto_tools_raw if str(x).strip()}
+else:
+    AUTO_POLL_TOOLS = {"hybrid_search"}
+if not AUTO_POLL_TOOLS:
+    AUTO_POLL_TOOLS = {"hybrid_search"}
 POLLING_CONVERSATION_ID = _POLLING_CFG.get("conversation_id")
 POLLING_CURSOR_PATH = str(
     _POLLING_CFG.get("cursor_path") or os.path.join(SKILL_DIR, "poll_cursor.json")
 )
 POLLING_SHOW_STATUS = bool(_POLLING_CFG.get("show_status", True))
 POLLING_DEBUG_LOG = bool(_POLLING_CFG.get("debug_log", False))
+_STARTUP_CFG = _RUNTIME_CFG.get("startup", {})
+if not isinstance(_STARTUP_CFG, dict):
+    _STARTUP_CFG = {}
+WARMUP_GC_ENABLED = bool(_STARTUP_CFG.get("warmup_gc", EMBED_BACKEND == "llama_cpp"))
+WARMUP_PROBE_EMBED = bool(_STARTUP_CFG.get("warmup_probe_embed", EMBED_BACKEND != "llama_cpp"))
+WARMUP_QUERY = str(_STARTUP_CFG.get("warmup_query") or "geometry-mcp-warmup")
 
 print(
     f"[geometry-mcp] runtime cfg loaded: geo_db={GEO_DB} lcm_db={LCM_DB} "
-    f"model={EMBED_MODEL_NAME} geometry_overrides={len(_GEOMETRY_CFG_OVERRIDES)} "
-    f"polling_enabled={POLLING_ENABLED} interval={POLLING_INTERVAL_SEC}s limit={POLLING_LIMIT}",
+    f"embed_backend={EMBED_BACKEND} model={EMBED_MODEL_NAME} "
+    f"geometry_overrides={len(_GEOMETRY_CFG_OVERRIDES)} "
+    f"polling_enabled={POLLING_ENABLED} interval={POLLING_INTERVAL_SEC}s "
+    f"limit={POLLING_LIMIT} auto_limit={POLLING_AUTO_LIMIT} auto_tools={sorted(AUTO_POLL_TOOLS)}",
     file=sys.stderr,
 )
 
 #  Lazy-load heavy libs 
-_model = None
 _gc = None
+_gc_lock = threading.Lock()
+_warmup_thread = None
+_warmup_state = {
+    "started": False,
+    "completed": False,
+    "ok": False,
+    "error": None,
+    "started_at": 0.0,
+    "finished_at": 0.0,
+}
 _poll_lock = threading.Lock()
 _last_poll_ts = 0.0
 
-def get_model():
-    global _model
-    if _model is None:
-        from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer(EMBED_MODEL_NAME)
-    return _model
+
+def _is_warmup_running() -> bool:
+    return bool(
+        WARMUP_GC_ENABLED
+        and _warmup_state.get("started")
+        and not _warmup_state.get("completed")
+    )
+
 
 def get_gc():
     global _gc
-    if _gc is None:
+    if _gc is not None:
+        return _gc
+    with _gc_lock:
+        if _gc is not None:
+            return _gc
         from lcm_geometry_controller import GeometryController, GeometryConfig, EmbeddingProvider
+
         provider = EmbeddingProvider(
             model_name=EMBED_MODEL_NAME,
-            device=str(os.getenv("GEOMETRY_EMBED_DEVICE", "cpu") or "cpu"),
+            device=EMBED_DEVICE,
+            backend=EMBED_BACKEND,
+            gguf_model_path=EMBED_GGUF_PATH,
+            gguf_n_ctx=EMBED_GGUF_N_CTX,
+            gguf_n_threads=EMBED_GGUF_N_THREADS,
+            http_url=EMBED_HTTP_URL,
+            http_timeout_sec=EMBED_HTTP_TIMEOUT_SEC,
         )
-        if _GEOMETRY_CFG_OVERRIDES:
-            valid_keys = set(getattr(GeometryConfig, "__dataclass_fields__", {}).keys())
-            safe_overrides = {}
-            for k, v in _GEOMETRY_CFG_OVERRIDES.items():
-                if k in valid_keys:
-                    safe_overrides[k] = v
-                else:
-                    print(f"[geometry-mcp] Ignoring unknown geometry_config key: {k}", file=sys.stderr)
-            _gc = GeometryController(
-                GEO_DB,
-                cfg=GeometryConfig(**safe_overrides),
-                embedding_provider=provider,
+
+        valid_keys = set(getattr(GeometryConfig, "__dataclass_fields__", {}).keys())
+        safe_overrides = {}
+        for k, v in (_GEOMETRY_CFG_OVERRIDES or {}).items():
+            if k in valid_keys:
+                safe_overrides[k] = v
+            else:
+                print(f"[geometry-mcp] Ignoring unknown geometry_config key: {k}", file=sys.stderr)
+
+        provider_dim = int(provider.embedding_dim)
+
+        cfg_dim_raw = (
+            _RUNTIME_CFG.get("embedding_dim")
+            if _RUNTIME_CFG.get("embedding_dim") is not None
+            else _EMBED_CFG.get("dim")
+        )
+        if cfg_dim_raw is None:
+            cfg_dim_raw = safe_overrides.get("embedding_dim")
+        if cfg_dim_raw is None:
+            cfg_dim_raw = EMBED_DIM
+        try:
+            cfg_dim = int(cfg_dim_raw)
+        except Exception:
+            cfg_dim = None
+
+        if cfg_dim is None:
+            safe_overrides["embedding_dim"] = provider_dim
+        elif cfg_dim != provider_dim:
+            print(
+                f"[geometry-mcp] embedding_dim mismatch in runtime_config: "
+                f"cfg={cfg_dim} provider={provider_dim}; forcing provider dim",
+                file=sys.stderr,
             )
+            safe_overrides["embedding_dim"] = provider_dim
         else:
-            _gc = GeometryController(GEO_DB, embedding_provider=provider)
+            safe_overrides["embedding_dim"] = cfg_dim
+
+        _gc = GeometryController(
+            GEO_DB,
+            cfg=GeometryConfig(**safe_overrides),
+            embedding_provider=provider,
+        )
     return _gc
+
+
+def _warmup_gc_background():
+    _warmup_state["started"] = True
+    _warmup_state["started_at"] = time.time()
+    try:
+        gc = get_gc()
+        if WARMUP_PROBE_EMBED:
+            provider = getattr(gc, "embedding_provider", None)
+            if provider is not None:
+                provider.embed(WARMUP_QUERY)
+        _warmup_state["ok"] = True
+    except Exception as exc:
+        _warmup_state["error"] = str(exc)
+        print(f"[geometry-mcp] startup warmup failed: {exc}", file=sys.stderr)
+    finally:
+        _warmup_state["completed"] = True
+        _warmup_state["finished_at"] = time.time()
+
+
+def _start_warmup_thread():
+    global _warmup_thread
+    if not WARMUP_GC_ENABLED or _warmup_thread is not None:
+        return
+    _warmup_state["started"] = True
+    _warmup_state["started_at"] = time.time()
+    _warmup_thread = threading.Thread(
+        target=_warmup_gc_background,
+        name="geometry-mcp-warmup",
+        daemon=True,
+    )
+    _warmup_thread.start()
+
+
+_start_warmup_thread()
 
 
 def _poll_normalized_conversation_id():
@@ -265,12 +406,21 @@ def _sync_lcm_dag_edges(backup: bool = True) -> dict:
         }
 
 
-def _poll_lcm_if_due(force: bool = False, limit_override: int | None = None) -> dict:
+def _poll_lcm_if_due(force: bool = False, limit_override: int | None = None, auto: bool = False) -> dict:
     global _last_poll_ts
     if not POLLING_ENABLED:
         return _with_poll_lag({"enabled": False, "skipped": "disabled"})
 
     now = time.time()
+    if auto and _is_warmup_running():
+        return _with_poll_lag({
+            "enabled": True,
+            "skipped": "warming_up",
+            "warmup_elapsed_seconds": round(
+                max(0.0, now - float(_warmup_state.get("started_at") or now)), 3
+            ),
+        })
+
     with _poll_lock:
         elapsed = now - float(_last_poll_ts or 0.0)
         min_interval = max(0.0, float(POLLING_INTERVAL_SEC))
@@ -283,7 +433,14 @@ def _poll_lcm_if_due(force: bool = False, limit_override: int | None = None) -> 
 
         gc = get_gc()
         since_rowid = _load_poll_cursor()
-        safe_limit = max(1, int(limit_override if limit_override is not None else POLLING_LIMIT))
+        safe_limit = max(
+            1,
+            int(
+                limit_override
+                if limit_override is not None
+                else (POLLING_AUTO_LIMIT if auto else POLLING_LIMIT)
+            ),
+        )
         conv_id = _poll_normalized_conversation_id()
         try:
             out = gc.poll_lcm_for_new_items(
@@ -342,14 +499,11 @@ def _poll_status_line(status: dict | None) -> str:
 def _embed_query(query: str) -> list[float]:
     gc = get_gc()
     provider = getattr(gc, "embedding_provider", None)
-    if provider is not None:
-        try:
-            return list(provider.embed(query))
-        except Exception as exc:
-            if POLLING_DEBUG_LOG:
-                print(f"[geometry-mcp] Provider query embed fallback due to: {exc}", file=sys.stderr)
-    model = get_model()
-    return model.encode([query], normalize_embeddings=True)[0].tolist()
+    if provider is None:
+        raise RuntimeError(
+            "Geometry controller has no embedding provider configured; cannot embed query"
+        )
+    return list(provider.embed(query))
 
 
 def _get_daily_log_content(gdb_conn, branch_id, max_entries, max_chars):
@@ -669,6 +823,14 @@ def do_branch_report(branch_id):
 def do_geometry_stats():
     conn = sqlite3.connect(GEO_DB)
     conn.row_factory = sqlite3.Row
+    provider = None
+    if not _is_warmup_running() or _gc is not None:
+        try:
+            gc = get_gc()
+            provider = getattr(gc, "embedding_provider", None)
+        except Exception as exc:
+            if POLLING_DEBUG_LOG:
+                print(f"[geometry-mcp] geometry_stats provider unavailable: {exc}", file=sys.stderr)
 
     branches = conn.execute("SELECT COUNT(*) FROM branch_states").fetchone()[0]
     nodes = conn.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0]
@@ -687,6 +849,13 @@ def do_geometry_stats():
     avg_role_div = round(r['rd'], 4) if r['rd'] is not None else 0
 
     conn.close()
+    embed_dim = int(
+        getattr(provider, "embedding_dim", EMBED_DIM)
+        if provider is not None
+        else (_EMBED_CFG.get("dim") or _RUNTIME_CFG.get("embedding_dim") or EMBED_DIM)
+    )
+    embed_model = str(getattr(provider, "model_name", EMBED_MODEL_NAME) if provider is not None else EMBED_MODEL_NAME)
+    embed_backend = str(getattr(provider, "backend", EMBED_BACKEND) if provider is not None else EMBED_BACKEND)
     return {
         'total_branches': branches,
         'total_nodes': nodes,
@@ -695,8 +864,17 @@ def do_geometry_stats():
         'avg_eff_rank': avg_rank,
         'avg_coherence': avg_coh,
         'avg_role_diversity': avg_role_div,
-        'embedding_model': EMBED_MODEL_NAME,
-        'embedding_dim': 384
+        'embedding_backend': embed_backend,
+        'embedding_model': embed_model,
+        'embedding_dim': embed_dim,
+        'warmup': {
+            'enabled': bool(WARMUP_GC_ENABLED),
+            'running': bool(_is_warmup_running()),
+            'started': bool(_warmup_state.get('started')),
+            'completed': bool(_warmup_state.get('completed')),
+            'ok': bool(_warmup_state.get('ok')),
+            'error': _warmup_state.get('error'),
+        },
     }
 
 
@@ -1329,10 +1507,11 @@ async def list_tools():
 
 @server.call_tool()
 async def call_tool(name, arguments):
+    tool_started = time.time()
+    auto_poll_status = None
     try:
-        auto_poll_status = None
-        if name not in ("sync_lcm_ingest", "sync_lcm_dag_edges"):
-            auto_poll_status = _poll_lcm_if_due(force=False)
+        if name in AUTO_POLL_TOOLS:
+            auto_poll_status = _poll_lcm_if_due(force=False, auto=True)
         poll_line = _poll_status_line(auto_poll_status)
 
         if name == "hybrid_search":
@@ -1463,7 +1642,12 @@ async def call_tool(name, arguments):
                      f"  Avg eff_rank: {stats['avg_eff_rank']}",
                      f"  Avg coherence: {stats['avg_coherence']}",
                      f"  Avg role_diversity: {stats.get('avg_role_diversity', 0)}",
-                     f"  Embedding: {stats['embedding_model']} ({stats['embedding_dim']}d)"]
+                     f"  Embedding: backend={stats.get('embedding_backend', 'unknown')} "
+                     f"model={stats['embedding_model']} ({stats['embedding_dim']}d)",
+                     f"  Warmup: enabled={stats.get('warmup', {}).get('enabled')} "
+                     f"started={stats.get('warmup', {}).get('started')} "
+                     f"completed={stats.get('warmup', {}).get('completed')} "
+                     f"ok={stats.get('warmup', {}).get('ok')}"]
             if poll_line:
                 lines.insert(1, poll_line)
             return [TextContent(type="text", text="\n".join(lines))]
@@ -1769,13 +1953,35 @@ async def call_tool(name, arguments):
     except Exception as e:
         import traceback
         return [TextContent(type="text", text=f"Error in {name}: {e}\n{traceback.format_exc()}")]
+    finally:
+        elapsed_ms = int((time.time() - tool_started) * 1000)
+        poll_tag = "poll=none"
+        if isinstance(auto_poll_status, dict):
+            if auto_poll_status.get("error"):
+                poll_tag = f"poll=error:{auto_poll_status.get('error')}"
+            elif auto_poll_status.get("skipped"):
+                poll_tag = f"poll=skip:{auto_poll_status.get('skipped')}"
+            else:
+                poll_tag = (
+                    f"poll=ok polled={int(auto_poll_status.get('polled', 0) or 0)} "
+                    f"processed={int(auto_poll_status.get('processed', 0) or 0)} "
+                    f"failed={int(auto_poll_status.get('failed', 0) or 0)}"
+                )
+        print(
+            f"[geometry-mcp] tool={name} dur_ms={elapsed_ms} {poll_tag} "
+            f"warmup_running={_is_warmup_running()}",
+            file=sys.stderr,
+        )
 
 
 #  Main 
 async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+    except Exception as exc:
+        print(f"[geometry-mcp] fatal main error: {exc}", file=sys.stderr)
+        raise
 
 if __name__ == "__main__":
     asyncio.run(main())
-
