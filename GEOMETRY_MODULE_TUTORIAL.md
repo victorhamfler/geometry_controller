@@ -2,7 +2,7 @@
 
 **Version:** 1.5
 **Module:** `lcm_geometry_controller.py`
-**Last Updated:** 2026-04-13
+**Last Updated:** 2026-04-18
 
 This tutorial explains how to use the geometry module as a semantic companion to OpenClaw LCM.
 
@@ -17,6 +17,7 @@ LCM keyword search and geometry semantic search are complementary:
 
 The geometry layer uses embeddings (default 384-dim, `all-MiniLM-L6-v2`) to find related context even when exact keywords differ.  
 Current runtime also supports GGUF embedding models (for example Gemma 300M) via `embedding.backend = "llama_cpp"` in `runtime_config.json`.
+The runtime signature guard canonicalizes GGUF model identity, so using filename or full-path `model_name` no longer causes false mismatch.
 
 ---
 

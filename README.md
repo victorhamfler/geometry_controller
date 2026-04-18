@@ -4,6 +4,11 @@ Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geomet
 
 ## Latest Update (2026-04-18)
 
+- Embedding runtime signature canonicalization fix (GGUF):
+  - normalized `model_name` identity to basename for `llama_cpp`
+  - signature checks now use canonicalized comparison (`model_name`, `gguf_model_path`, backend aliases)
+  - legacy raw-signature variants are auto-refreshed when canonical identity matches
+  - removes false mismatch between ad-hoc full-path model_name and filename-style config model_name
 - MCP timeout/stability hardening for GGUF backends:
   - auto-poll is now tool-scoped (`polling.auto_tools`, default `["hybrid_search"]`)
   - auto-poll uses independent low cap (`polling.auto_limit`, default `3` for `llama_cpp`)
@@ -243,6 +248,7 @@ Safety guard:
 
 - Controller persists an embedding runtime signature in `maintenance_state`.
 - If backend/model/dimension changes on an existing `lcm_geometry.db`, startup fails by default to prevent mixed-vector corruption.
+- For GGUF, filename-vs-full-path constructor style no longer causes false mismatches; identity is canonicalized before comparison.
 - To intentionally migrate in-place, set `GEOMETRY_ALLOW_EMBEDDING_SIGNATURE_CHANGE=1` (recommended only after controlled migration/rebuild).
 
 Useful keys in `geometry_config`:

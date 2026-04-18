@@ -701,9 +701,18 @@ class EmbeddingProvider:
 
     def descriptor(self) -> dict[str, Any]:
         """Lightweight backend/model identity for runtime diagnostics + DB guard."""
+        model_name = str(self.model_name or "")
+        if self.backend == "llama_cpp":
+            # Canonicalize GGUF model identity so signature checks are stable
+            # whether callers pass model_name as filename or full path.
+            try:
+                model_name = os.path.basename(self._resolve_gguf_model_path())
+            except Exception:
+                fallback = os.path.basename(model_name)
+                model_name = fallback or model_name
         return {
             "backend": self.backend,
-            "model_name": str(self.model_name or ""),
+            "model_name": model_name,
             "device": str(self.device or ""),
             "gguf_model_path": self._resolve_gguf_model_path() if self.backend == "llama_cpp" else None,
             "http_url": self.http_url if self.backend == "http" else None,
@@ -2730,6 +2739,40 @@ class GeometryController:
             "updated_ts": time.time(),
         }
 
+    @staticmethod
+    def _canonicalize_embedding_signature(sig: dict[str, Any]) -> dict[str, Any]:
+        out = dict(sig or {})
+        backend = str(out.get("backend") or "").strip().lower().replace("-", "_")
+        if backend in ("gguf", "llama"):
+            backend = "llama_cpp"
+        out["backend"] = backend
+
+        model_name = str(out.get("model_name") or "").strip()
+        gguf_path = out.get("gguf_model_path")
+        gguf_norm = None
+        if gguf_path:
+            try:
+                gguf_norm = os.path.abspath(os.path.expanduser(str(gguf_path)))
+            except Exception:
+                gguf_norm = str(gguf_path)
+        out["gguf_model_path"] = gguf_norm
+
+        if backend == "llama_cpp":
+            if model_name:
+                model_name = os.path.basename(model_name)
+            elif gguf_norm:
+                model_name = os.path.basename(gguf_norm)
+        out["model_name"] = model_name
+
+        http_url = str(out.get("http_url") or "").strip()
+        out["http_url"] = http_url or None
+
+        try:
+            out["embedding_dim"] = int(out.get("embedding_dim") or 0)
+        except Exception:
+            out["embedding_dim"] = 0
+        return out
+
     def _enforce_embedding_runtime_signature(self) -> None:
         sig = self._build_embedding_runtime_signature()
         if not sig:
@@ -2750,8 +2793,14 @@ class GeometryController:
             existing = {}
 
         fields = ("backend", "model_name", "embedding_dim", "gguf_model_path", "http_url")
-        mismatch = any(existing.get(f) != sig.get(f) for f in fields)
+        existing_c = self._canonicalize_embedding_signature(existing)
+        sig_c = self._canonicalize_embedding_signature(sig)
+        mismatch = any(existing_c.get(f) != sig_c.get(f) for f in fields)
         if not mismatch:
+            raw_identity_mismatch = any(existing.get(f) != sig.get(f) for f in fields)
+            if raw_identity_mismatch:
+                # Canonical refresh: keep stored signature aligned with current normalized identity.
+                self.db.set_maintenance_state(key, current_text)
             return
 
         allow_change = str(os.getenv("GEOMETRY_ALLOW_EMBEDDING_SIGNATURE_CHANGE", "")).strip().lower() in {
@@ -5560,4 +5609,3 @@ if __name__ == "__main__":
             print(f"    {k}: {v}")
 
     print("\n=== smoke test passed ===")
-

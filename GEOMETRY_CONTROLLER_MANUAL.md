@@ -4,7 +4,7 @@
 **Module:** `lcm_geometry_controller.py`
 **Geometry DB:** `<openclaw_home>/lcm_geometry.db`
 **LCM DB:** `<openclaw_home>/lcm.db`
-**Last Updated:** 2026-04-13
+**Last Updated:** 2026-04-18
 
 ---
 
@@ -516,7 +516,7 @@ EmbeddingProvider(
 
 **`ep.embedding_dim`** â€” Lazy property returning model's embedding dimension.
 
-**`ep.descriptor()`** â€” Runtime signature fields (`backend`, `model_name`, `embedding_dim`, backend-specific connection info).
+**`ep.descriptor()`** â€” Runtime signature fields (`backend`, `model_name`, `embedding_dim`, backend-specific connection info). For `llama_cpp`, `model_name` is canonicalized to GGUF basename so signature identity is stable for filename/path input variants.
 
 ### Integration with GeometryController
 
@@ -541,6 +541,8 @@ The `EmbeddingProvider` is lazy â€” the model is only loaded on first `embe
 
 - compares backend/model/dimension against prior DB runtime signature
 - blocks startup on mismatch to prevent mixed embedding spaces in one DB
+- canonicalizes GGUF identity before comparison (backend aliases, model basename, normalized gguf path)
+- auto-refreshes legacy raw signature variants when canonical identity matches
 - override only when intentional: `GEOMETRY_ALLOW_EMBEDDING_SIGNATURE_CHANGE=1`
 
 ---
