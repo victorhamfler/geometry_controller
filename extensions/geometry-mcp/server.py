@@ -242,11 +242,100 @@ def _set_recency_candidate(out, branch_id, candidate, source):
     if not bid or ts is None:
         return
     current = out.get(bid)
-    if current is None or ts < float(current.get("source_timestamp") or 0.0):
+    if current is None:
         out[bid] = {
             "source_timestamp": float(ts),
+            "last_source_timestamp": float(ts),
             "timestamp_source": source,
+            "last_timestamp_source": source,
         }
+        return
+    source_ts = _coerce_timestamp(current.get("source_timestamp"))
+    last_ts = _coerce_timestamp(current.get("last_source_timestamp"))
+    if source_ts is None or ts < source_ts:
+        current["source_timestamp"] = float(ts)
+        current["timestamp_source"] = source
+    if last_ts is None or ts > last_ts:
+        current["last_source_timestamp"] = float(ts)
+        current["last_timestamp_source"] = source
+
+
+def _activity_meta(ts, half_life_days=14.0, now_ts=None):
+    meta = _recency_meta(ts, half_life_days, now_ts)
+    return {
+        "last_source_timestamp": meta["source_timestamp"],
+        "last_source_updated": meta["last_updated"],
+        "activity_age_days": meta["age_days"],
+        "activity_score": meta["recency_score"],
+        "activity_label": meta["recency_label"],
+    }
+
+
+def _normalize_state_filter(value):
+    if value in (None, "", "ALL", "all", "*"):
+        return None
+    raw_values = value if isinstance(value, list) else str(value).replace(",", " ").split()
+    states = []
+    seen = set()
+    for raw in raw_values:
+        state = str(raw or "").strip().upper()
+        if not state or state in ("ALL", "*") or state in seen:
+            continue
+        seen.add(state)
+        states.append(state)
+    return states or None
+
+
+def _activity_filter_from_args(activity_state=None, activity_within_days=None, state_group=None):
+    days = _coerce_float(activity_within_days, 14.0)
+    if days < 0.0:
+        days = 14.0
+    threshold = time.time() - (days * 86400.0)
+    activity = str(activity_state or "").strip().lower()
+    group = str(state_group or "").strip().lower()
+    if not activity and group == "working":
+        activity = "recent"
+    elif not activity and group in ("settled", "dormant"):
+        activity = "stale"
+
+    after_ts = None
+    before_ts = None
+    if activity in ("recent", "active", "current"):
+        after_ts = threshold
+    elif activity in ("stale", "dormant", "old", "inactive"):
+        before_ts = threshold
+    return activity or None, days, after_ts, before_ts
+
+
+def _state_filter_from_group(state=None, state_group=None):
+    explicit = _normalize_state_filter(state)
+    if explicit:
+        return explicit
+    group = str(state_group or "").strip().lower()
+    if group == "working":
+        return ["FORMING", "ACTIVE", "REACTIVATING"]
+    if group in ("settled", "dormant"):
+        return ["STABLE"]
+    return None
+
+
+def _branch_ids_for_activity(metadata, after_ts=None, before_ts=None):
+    if after_ts is None and before_ts is None:
+        return None
+    ids = []
+    for bid, meta in (metadata or {}).items():
+        if _timestamp_in_bounds(meta.get("last_source_timestamp"), after_ts, before_ts):
+            ids.append(str(bid))
+    return ids
+
+
+def _activity_state_for_ts(ts, activity_within_days=14.0, now_ts=None):
+    t = _coerce_timestamp(ts)
+    if t is None:
+        return "unknown"
+    now = time.time() if now_ts is None else float(now_ts)
+    days = max(0.0, _coerce_float(activity_within_days, 14.0))
+    return "recent" if t >= now - (days * 86400.0) else "stale"
 
 
 def _load_geometry_recency_metadata(gc):
@@ -277,7 +366,7 @@ def _load_geometry_recency_metadata(gc):
         try:
             for r in gconn.execute(
                 """
-                SELECT mn.branch_id, MIN(dl.created_ts) AS ts
+                SELECT mn.branch_id, MIN(dl.created_ts) AS first_ts, MAX(dl.created_ts) AS last_ts
                 FROM daily_log_content dl
                 JOIN memory_nodes mn ON mn.id = dl.node_id
                 GROUP BY mn.branch_id
@@ -285,7 +374,8 @@ def _load_geometry_recency_metadata(gc):
             ).fetchall():
                 bid = str(r["branch_id"] or "")
                 if bid:
-                    _set_recency_candidate(out, bid, r["ts"], "daily_log_content")
+                    _set_recency_candidate(out, bid, r["first_ts"], "daily_log_content")
+                    _set_recency_candidate(out, bid, r["last_ts"], "daily_log_content")
         except Exception:
             pass
 
@@ -306,11 +396,15 @@ def _load_geometry_recency_metadata(gc):
 
     msg_to_branches = defaultdict(set)
     geom_min = {}
+    geom_max = {}
     for r in geo_rows:
         bid = str(r["branch_id"] or "")
         if not bid:
             continue
         geom_min[bid] = _min_ts(geom_min.get(bid), r["timestamp"])
+        ts = _coerce_timestamp(r["timestamp"])
+        if ts is not None and (geom_max.get(bid) is None or ts > geom_max[bid]):
+            geom_max[bid] = ts
         mid = _numeric_lcm_id(r["lcm_id"])
         if mid is not None:
             msg_to_branches[mid].add(bid)
@@ -345,6 +439,30 @@ def _load_geometry_recency_metadata(gc):
                 for chunk in _chunked(conv_ids):
                     ph = ",".join(["?"] * len(chunk))
                     rows = lconn.execute(
+                        f"""
+                        SELECT conversation_id,
+                               MIN(created_at) AS first_at,
+                               MAX(created_at) AS last_at
+                        FROM messages
+                        WHERE conversation_id IN ({ph})
+                        GROUP BY conversation_id
+                        """,
+                        tuple(chunk),
+                    ).fetchall()
+                    for row in rows:
+                        bid = missing_conv.get(int(row["conversation_id"]))
+                        if bid:
+                            _set_recency_candidate(out, bid, row["first_at"], "lcm_messages")
+                            _set_recency_candidate(out, bid, row["last_at"], "lcm_messages")
+
+                missing_conv = {
+                    cid: bid for cid, bid in missing_conv.items()
+                    if bid not in out
+                }
+                conv_ids = list(missing_conv.keys())
+                for chunk in _chunked(conv_ids):
+                    ph = ",".join(["?"] * len(chunk))
+                    rows = lconn.execute(
                         f"SELECT conversation_id, created_at FROM conversations WHERE conversation_id IN ({ph})",
                         tuple(chunk),
                     ).fetchall()
@@ -359,8 +477,10 @@ def _load_geometry_recency_metadata(gc):
 
     for bid in branch_set:
         if bid not in out:
-            fallback_ts = geom_min.get(bid) or fallback_update.get(bid) or 0.0
-            _set_recency_candidate(out, bid, fallback_ts, "geometry_last_update")
+            fallback_first = geom_min.get(bid) or fallback_update.get(bid) or 0.0
+            fallback_last = geom_max.get(bid) or fallback_update.get(bid) or fallback_first
+            _set_recency_candidate(out, bid, fallback_first, "geometry_last_update")
+            _set_recency_candidate(out, bid, fallback_last, "geometry_last_update")
     return {
         bid: meta
         for bid, meta in out.items()
@@ -883,6 +1003,9 @@ def _rank_collapsing_sidecar(
     updated_before_ts=None,
     recency_timestamps=None,
     recency_metadata=None,
+    include_states=None,
+    activity_after_ts=None,
+    activity_before_ts=None,
 ):
     try:
         import numpy as np
@@ -895,16 +1018,23 @@ def _rank_collapsing_sidecar(
 
     collapsing = []
     recency_map = recency_timestamps or {}
+    include_set = set(include_states or [])
     for s in gc.db.all_branches():
         state_val = str(getattr(getattr(s, "state", None), "value", getattr(s, "state", "")) or "")
         if state_val != "COLLAPSING":
+            continue
+        if include_set and state_val not in include_set:
             continue
         if int(getattr(s, "node_count", 0) or 0) <= 0:
             continue
         mean_vec = getattr(s, "mean_vec", None) or []
         if not mean_vec:
             continue
+        meta = (recency_metadata or {}).get(s.branch_id, {})
         effective_ts = recency_map.get(s.branch_id) or getattr(s, "last_update_ts", None)
+        activity_ts = meta.get("last_source_timestamp") or effective_ts
+        if not _timestamp_in_bounds(activity_ts, activity_after_ts, activity_before_ts):
+            continue
         if not _timestamp_in_bounds(
             effective_ts,
             updated_after_ts,
@@ -960,6 +1090,8 @@ def _rank_collapsing_sidecar(
         out.append({
             "branch_id": r.branch_id,
             "total_score": round(r.total_score, 4),
+            "base_score": round(r.total_score, 4),
+            "ranking_score": round(float(getattr(r, "final_score", r.total_score) or 0.0), 4),
             "final_score": round(float(getattr(r, "final_score", r.total_score) or 0.0), 4),
             "retrieval_kappa": round(r.total_score, 4),
             "sem_score": round(r.sem_score, 4),
@@ -973,6 +1105,11 @@ def _rank_collapsing_sidecar(
             "last_update_ts": recency["last_update_ts"],
             "source_timestamp": recency["source_timestamp"],
             "timestamp_source": meta.get("timestamp_source") or ("geometry_last_update" if not recency_map.get(r.branch_id) else "source_time"),
+            "last_source_timestamp": (activity := _activity_meta(meta.get("last_source_timestamp") or effective_ts, recency_half_life_days))["last_source_timestamp"],
+            "last_source_updated": activity["last_source_updated"],
+            "last_timestamp_source": meta.get("last_timestamp_source") or meta.get("timestamp_source") or "geometry_last_update",
+            "activity_age_days": activity["activity_age_days"],
+            "activity_label": activity["activity_label"],
             "last_updated": recency["last_updated"],
             "age_days": recency["age_days"],
             "recency_label": recency["recency_label"],
@@ -994,6 +1131,10 @@ def do_hybrid_search(
     updated_before=None,
     date_from=None,
     date_to=None,
+    state=None,
+    state_group=None,
+    activity_state=None,
+    activity_within_days=None,
 ):
     gc = get_gc()
     query_id = str(uuid.uuid4())
@@ -1017,6 +1158,20 @@ def do_hybrid_search(
         bid: float(meta["source_timestamp"])
         for bid, meta in geometry_recency_meta.items()
     }
+    include_states = _state_filter_from_group(state=state, state_group=state_group)
+    normalized_state_group = str(state_group or "all").strip().lower() or "all"
+    if normalized_state_group not in ("all", "working", "settled", "dormant"):
+        normalized_state_group = "all"
+    normalized_activity_state, activity_days, activity_after_ts, activity_before_ts = _activity_filter_from_args(
+        activity_state=activity_state,
+        activity_within_days=activity_within_days,
+        state_group=normalized_state_group,
+    )
+    activity_branch_ids = _branch_ids_for_activity(
+        geometry_recency_meta,
+        after_ts=activity_after_ts,
+        before_ts=activity_before_ts,
+    )
 
     # Geometry ranking
     ranked = gc.rank_retrieval(
@@ -1027,6 +1182,8 @@ def do_hybrid_search(
         updated_after_ts=updated_after_ts,
         updated_before_ts=updated_before_ts,
         recency_timestamps=geometry_recency_ts,
+        include_states=set(include_states) if include_states else None,
+        branch_ids=activity_branch_ids,
     )
     geo_results = []
     implicit_feedback_logged = 0
@@ -1041,6 +1198,14 @@ def do_hybrid_search(
         recency = _recency_meta(
             effective_ts,
             half_life_days,
+        )
+        activity = _activity_meta(
+            recency_info.get("last_source_timestamp") or effective_ts,
+            half_life_days,
+        )
+        activity_label = _activity_state_for_ts(
+            activity["last_source_timestamp"],
+            activity_within_days=activity_days,
         )
         try:
             gc.record_retrieval(
@@ -1059,6 +1224,8 @@ def do_hybrid_search(
         geo_results.append({
             'branch_id': r.branch_id,
             'total_score': round(r.total_score, 4),
+            'base_score': round(r.total_score, 4),
+            'ranking_score': round(float(getattr(r, "final_score", r.total_score) or 0.0), 4),
             'final_score': round(float(getattr(r, "final_score", r.total_score) or 0.0), 4),
             'retrieval_kappa': round(r.total_score, 4),
             'sem_score': round(r.sem_score, 4),
@@ -1072,6 +1239,13 @@ def do_hybrid_search(
             'last_update_ts': recency["last_update_ts"],
             'source_timestamp': recency["source_timestamp"],
             'timestamp_source': recency_info.get("timestamp_source") or ('source_time' if geometry_recency_ts.get(str(r.branch_id)) else 'geometry_last_update'),
+            'last_source_timestamp': activity["last_source_timestamp"],
+            'last_source_updated': activity["last_source_updated"],
+            'last_timestamp_source': recency_info.get("last_timestamp_source") or recency_info.get("timestamp_source") or ('source_time' if geometry_recency_ts.get(str(r.branch_id)) else 'geometry_last_update'),
+            'activity_age_days': activity["activity_age_days"],
+            'activity_score': activity["activity_score"],
+            'activity_label': activity["activity_label"],
+            'activity_state': activity_label,
             'last_updated': recency["last_updated"],
             'age_days': recency["age_days"],
             'recency_label': recency["recency_label"],
@@ -1088,6 +1262,9 @@ def do_hybrid_search(
         updated_before_ts=updated_before_ts,
         recency_timestamps=geometry_recency_ts,
         recency_metadata=geometry_recency_meta,
+        include_states=include_states,
+        activity_after_ts=activity_after_ts,
+        activity_before_ts=activity_before_ts,
     )
 
     # LCM keyword search
@@ -1130,7 +1307,10 @@ def do_hybrid_search(
             matches,
             key=lambda m: _coerce_timestamp(m.get('created_at')) or float("-inf"),
         )['created_at']
+        if not _timestamp_in_bounds(most_recent, activity_after_ts, activity_before_ts):
+            continue
         recency = _recency_meta(most_recent, half_life_days)
+        activity = _activity_meta(most_recent, half_life_days)
         raw_score = (
             2.0 * len(set(m['keyword_matched'] for m in matches))
             + math.log1p(len(matches))
@@ -1146,6 +1326,13 @@ def do_hybrid_search(
             'last_update_ts': recency["last_update_ts"],
             'source_timestamp': recency["source_timestamp"],
             'timestamp_source': "lcm_messages",
+            'last_source_timestamp': activity["last_source_timestamp"],
+            'last_source_updated': activity["last_source_updated"],
+            'last_timestamp_source': "lcm_messages",
+            'activity_age_days': activity["activity_age_days"],
+            'activity_score': activity["activity_score"],
+            'activity_label': activity["activity_label"],
+            'activity_state': _activity_state_for_ts(activity["last_source_timestamp"], activity_days),
             'last_updated': recency["last_updated"],
             'age_days': recency["age_days"],
             'recency_score': recency["recency_score"],
@@ -1177,7 +1364,10 @@ def do_hybrid_search(
         for r in rows:
             if not _timestamp_in_bounds(r["created_at"], updated_after_ts, updated_before_ts):
                 continue
+            if not _timestamp_in_bounds(r["created_at"], activity_after_ts, activity_before_ts):
+                continue
             recency = _recency_meta(r["created_at"], half_life_days)
+            activity = _activity_meta(r["created_at"], half_life_days)
             daily_keyword.append({
                 "branch_id": r["branch_id"],
                 "node_id": r["node_id"],
@@ -1188,6 +1378,13 @@ def do_hybrid_search(
                 "last_update_ts": recency["last_update_ts"],
                 "source_timestamp": recency["source_timestamp"],
                 "timestamp_source": "daily_log_content",
+                "last_source_timestamp": activity["last_source_timestamp"],
+                "last_source_updated": activity["last_source_updated"],
+                "last_timestamp_source": "daily_log_content",
+                "activity_age_days": activity["activity_age_days"],
+                "activity_score": activity["activity_score"],
+                "activity_label": activity["activity_label"],
+                "activity_state": _activity_state_for_ts(activity["last_source_timestamp"], activity_days),
                 "last_updated": recency["last_updated"],
                 "age_days": recency["age_days"],
                 "recency_score": recency["recency_score"],
@@ -1235,7 +1432,10 @@ def do_hybrid_search(
             sim = float(np.dot(q, v) / den)
             if not _timestamp_in_bounds(r["created_at"], updated_after_ts, updated_before_ts):
                 continue
+            if not _timestamp_in_bounds(r["created_at"], activity_after_ts, activity_before_ts):
+                continue
             recency = _recency_meta(r["created_at"], half_life_days)
+            activity = _activity_meta(r["created_at"], half_life_days)
             daily_semantic.append({
                 "branch_id": r["branch_id"],
                 "node_id": r["node_id"],
@@ -1246,6 +1446,13 @@ def do_hybrid_search(
                 "last_update_ts": recency["last_update_ts"],
                 "source_timestamp": recency["source_timestamp"],
                 "timestamp_source": "daily_log_content",
+                "last_source_timestamp": activity["last_source_timestamp"],
+                "last_source_updated": activity["last_source_updated"],
+                "last_timestamp_source": "daily_log_content",
+                "activity_age_days": activity["activity_age_days"],
+                "activity_score": activity["activity_score"],
+                "activity_label": activity["activity_label"],
+                "activity_state": _activity_state_for_ts(activity["last_source_timestamp"], activity_days),
                 "last_updated": recency["last_updated"],
                 "age_days": recency["age_days"],
                 "recency_score": recency["recency_score"],
@@ -1275,6 +1482,20 @@ def do_hybrid_search(
         'query_id': query_id,
         'query': query,
         'retrieval_mode': retrieval_mode,
+        'filters': {
+            'state': include_states or None,
+            'state_group': normalized_state_group,
+            'activity_state': normalized_activity_state,
+            'activity_within_days': activity_days,
+        },
+        'activity': {
+            'state': normalized_activity_state,
+            'within_days': activity_days,
+            'activity_after_ts': activity_after_ts,
+            'activity_before_ts': activity_before_ts,
+            'activity_after': _recency_meta(activity_after_ts, half_life_days)["last_updated"] if activity_after_ts is not None else None,
+            'activity_before': _recency_meta(activity_before_ts, half_life_days)["last_updated"] if activity_before_ts is not None else None,
+        },
         'recency': {
             'boost': boost,
             'half_life_days': half_life_days,
@@ -1849,6 +2070,25 @@ async def list_tools():
                         "type": "string",
                         "description": "Alias for updated_before, convenient for YYYY-MM-DD date ranges."
                     },
+                    "state": {
+                        "type": ["string", "array"],
+                        "items": {"type": "string"},
+                        "description": "Optional branch lifecycle state filter, e.g. ACTIVE, STABLE, FORMING, or [\"FORMING\",\"ACTIVE\"]."
+                    },
+                    "state_group": {
+                        "type": "string",
+                        "enum": ["all", "working", "settled", "dormant"],
+                        "description": "Convenience filter. working=recent FORMING/ACTIVE/REACTIVATING; settled/dormant=older STABLE."
+                    },
+                    "activity_state": {
+                        "type": "string",
+                        "enum": ["recent", "stale", "dormant", "all"],
+                        "description": "Filter by latest source activity, separate from geometric lifecycle state."
+                    },
+                    "activity_within_days": {
+                        "type": "number",
+                        "description": "Window for activity_state/state_group freshness checks. Default 14."
+                    },
                 },
                 "required": ["query"]
             }
@@ -2097,6 +2337,10 @@ async def call_tool(name, arguments):
                 updated_before=arguments.get("updated_before"),
                 date_from=arguments.get("date_from"),
                 date_to=arguments.get("date_to"),
+                state=arguments.get("state"),
+                state_group=arguments.get("state_group"),
+                activity_state=arguments.get("activity_state"),
+                activity_within_days=arguments.get("activity_within_days"),
             )
 
             lines = [
@@ -2117,6 +2361,19 @@ async def call_tool(name, arguments):
                     f"half_life_days={recency_meta.get('half_life_days', 14.0)} "
                     f"after={recency_meta.get('updated_after') or '-'} "
                     f"before={recency_meta.get('updated_before') or '-'}"
+                )
+            filters_meta = result.get("filters", {}) or {}
+            activity_meta = result.get("activity", {}) or {}
+            if filters_meta.get("state") or filters_meta.get("state_group") != "all" or filters_meta.get("activity_state"):
+                lines.insert(
+                    -1,
+                    " Filters: "
+                    f"state={filters_meta.get('state') or 'ALL'} "
+                    f"state_group={filters_meta.get('state_group') or 'all'} "
+                    f"activity={filters_meta.get('activity_state') or 'all'} "
+                    f"within_days={filters_meta.get('activity_within_days', 14.0)} "
+                    f"after={activity_meta.get('activity_after') or '-'} "
+                    f"before={activity_meta.get('activity_before') or '-'}"
                 )
             lines.append(" GEOMETRY DB (semantic similarity):")
             for i, r in enumerate(result['geometry']['results'], 1):

@@ -74,6 +74,9 @@ For `hybrid_search`, use:
 - `retrieval_mode="balanced"` for normal usage.
 - `recency_boost` when recent source memories should float up among relevant hits.
 - `updated_within_days` (alias of `max_age_days`) to restrict results to a recent window.
+- `state` when you need a specific geometry lifecycle state.
+- `activity_state="recent"` or `"stale"` when you need latest source activity, independent of lifecycle state.
+- `state_group="working"` for recent `FORMING`/`ACTIVE`/`REACTIVATING` branches, or `state_group="settled"` for older `STABLE` branches.
 
 Example recency-aware search:
 
@@ -84,6 +87,8 @@ geometry-hybrid__hybrid_search(
     retrieval_mode="balanced",
     recency_boost=0.35,
     updated_within_days=14,
+    state_group="working",
+    activity_within_days=14,
 )
 ```
 
@@ -93,6 +98,12 @@ Recency fields in returned rows:
 |---|---|
 | `source_timestamp` | Epoch timestamp used for recency |
 | `timestamp_source` | `lcm_messages`, `lcm_conversations`, `daily_log_content`, or `geometry_last_update` |
+| `last_source_timestamp` | Latest source timestamp used for activity filtering |
+| `last_source_updated` | ISO rendering of `last_source_timestamp` |
+| `activity_age_days` | Age in days from latest source activity |
+| `activity_state` | `recent`, `stale`, or `unknown` relative to `activity_within_days` |
+| `base_score` | Original semantic/trust ranking score |
+| `ranking_score` | Presented ordering score after optional recency blending |
 | `last_updated` | ISO rendering of `source_timestamp` |
 | `age_days` | Age in days from source timestamp |
 | `recency_score` | Half-life freshness score |

@@ -357,13 +357,19 @@ Useful parameters:
 - `min_age_days`: only return items at least this old
 - `updated_after` / `updated_before`: ISO timestamp/date or epoch bounds
 - `date_from` / `date_to`: date-range aliases, useful with `YYYY-MM-DD`
+- `state`: optional lifecycle-state filter such as `FORMING`, `ACTIVE`, `STABLE`, or a list of states
+- `activity_state`: optional latest-source-activity filter, `recent` or `stale`; separate from lifecycle state
+- `activity_within_days`: freshness window for `activity_state`; default `14`
+- `state_group`: convenience filter; `working` means recent `FORMING`/`ACTIVE`/`REACTIVATING`, while `settled` means older `STABLE`
 
 Result fields:
 
 - `total_score`: original geometry relevance/trust score
+- `base_score` / `ranking_score`: clearer aliases for original and presented ordering scores
 - `final_score`: relevance blended with recency when `recency_boost > 0`
 - `source_timestamp`: canonical epoch timestamp used for recency
 - `timestamp_source`: one of `lcm_messages`, `lcm_conversations`, `daily_log_content`, or `geometry_last_update`
+- `last_source_timestamp`, `last_source_updated`, `activity_age_days`, `activity_label`: latest source activity fields
 - `last_updated`: ISO rendering of `source_timestamp`
 - `age_days`, `recency_score`, `recency_label`: human/debug recency fields
 
@@ -374,7 +380,9 @@ Example:
   "query": "geometry controller recency",
   "top_n": 5,
   "recency_boost": 0.35,
-  "updated_within_days": 14
+  "updated_within_days": 14,
+  "state_group": "working",
+  "activity_within_days": 14
 }
 ```
 

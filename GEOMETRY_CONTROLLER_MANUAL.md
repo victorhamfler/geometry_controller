@@ -577,9 +577,15 @@ final_score   = (1 - recency_boost) * normalized_relevance
 For geometry branches, source timestamps are resolved in this order:
 
 1. LCM message `created_at` from numeric `memory_nodes.lcm_id`
-2. LCM conversation `created_at` for `conv_*` fallback
-3. `daily_log_content.created_ts` for daily-log branches
-4. Geometry `last_update_ts` only as a final fallback
+2. LCM message min/max `created_at` for `conv_*` fallback when branch lineage is sparse
+3. LCM conversation `created_at` for `conv_*` fallback when messages are unavailable
+4. `daily_log_content.created_ts` for daily-log branches
+5. Geometry `last_update_ts` only as a final fallback
+
+The MCP layer now keeps two source-time axes:
+
+- `source_timestamp`: the first/oldest canonical source time used for source-age recency.
+- `last_source_timestamp`: the latest canonical source time used for workflow/activity filtering.
 
 Supported hybrid-search filters:
 
@@ -592,8 +598,12 @@ Supported hybrid-search filters:
 | `min_age_days` | Keep only items at least this many days old |
 | `updated_after` / `updated_before` | ISO date/time or epoch bounds |
 | `date_from` / `date_to` | Date-range aliases for `YYYY-MM-DD` workflows |
+| `state` | Optional geometry lifecycle filter, such as `FORMING`, `ACTIVE`, `STABLE`, or a list |
+| `activity_state` | Optional latest-source-activity filter: `recent`, `stale`, or `dormant` |
+| `activity_within_days` | Window for `activity_state`; default `14` |
+| `state_group` | Convenience filter: `working` = recent `FORMING`/`ACTIVE`/`REACTIVATING`; `settled`/`dormant` = older `STABLE` |
 
-Recency-aware result rows include `source_timestamp`, `timestamp_source`, `last_updated`, `age_days`, `recency_score`, and `recency_label`. `timestamp_source` is one of `lcm_messages`, `lcm_conversations`, `daily_log_content`, or `geometry_last_update`.
+Recency-aware result rows include `source_timestamp`, `timestamp_source`, `last_updated`, `age_days`, `recency_score`, and `recency_label`. Activity-aware rows also include `last_source_timestamp`, `last_source_updated`, `last_timestamp_source`, `activity_age_days`, `activity_score`, `activity_label`, and `activity_state`. `base_score` is the original semantic/trust score and `ranking_score` is the presented ordering score; the legacy `retrieval_kappa` field remains as a compatibility alias for `base_score`.
 
 ### CSD Scoring (On New Message)
 

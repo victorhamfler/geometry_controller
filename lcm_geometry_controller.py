@@ -3060,6 +3060,8 @@ class GeometryController:
         updated_after_ts: Optional[float] = None,
         updated_before_ts: Optional[float] = None,
         recency_timestamps: Optional[dict[str, float]] = None,
+        include_states: Optional[set[BranchState | str]] = None,
+        branch_ids: Optional[list[str]] = None,
     ) -> list[RetrievalCandidate]:
         """
         Returns branches sorted by retrieval priority.
@@ -3071,8 +3073,12 @@ class GeometryController:
         proj_map = same_project or {}
         recency_map = recency_timestamps or {}
         excluded = {BranchState.COLLAPSING, BranchState.SPLIT_PENDING}
+        if branch_ids is not None and not [str(bid).strip() for bid in branch_ids if str(bid).strip()]:
+            return []
         scalar_rows = self.db.list_branch_scalars(
+            include_states=include_states,
             exclude_states=excluded,
+            branch_ids=branch_ids,
             updated_after_ts=None if recency_map else updated_after_ts,
             updated_before_ts=None if recency_map else updated_before_ts,
         )
