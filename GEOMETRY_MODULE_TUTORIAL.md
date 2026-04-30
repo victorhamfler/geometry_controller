@@ -78,6 +78,16 @@ For `hybrid_search`, use:
 - `activity_state="recent"` or `"stale"` when you need latest source activity, independent of lifecycle state.
 - `state_group="working"` for recent `FORMING`/`ACTIVE`/`REACTIVATING` branches, or `state_group="settled"` for older `STABLE` branches.
 
+The LCM keyword side also returns explainable ranking fields:
+
+| Field | Meaning |
+|---|---|
+| `matched_keywords` | Meaningful query terms represented by this LCM conversation |
+| `phrase_matched` | Whether the exact normalized multi-term phrase matched |
+| `keyword_debug` | Score components, raw/capped hit counts, and phrase hit count |
+
+Keyword ranking favors exact phrase and all-term matches, caps raw hit-count influence, and lightly penalizes very large conversations. This helps exact queries find focused conversations instead of being dominated by large histories with many incidental mentions.
+
 Example recency-aware search:
 
 ```python

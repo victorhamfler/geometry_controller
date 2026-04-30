@@ -18,6 +18,7 @@ import sys
 import os
 import json
 import math
+import re
 import time
 import threading
 import shutil
@@ -197,6 +198,92 @@ def _rerank_rows_by_recency(rows, score_key, ts_key, recency_boost=0.0, half_lif
         reverse=True,
     )
     return rows
+
+
+def _keyword_terms(query):
+    raw = str(query or "").strip()
+    terms = []
+    seen = set()
+    for token in re.findall(r"[\w.+#-]+", raw, flags=re.UNICODE):
+        term = token.strip()
+        key = term.lower()
+        if len(key) < 3 or key in seen:
+            continue
+        seen.add(key)
+        terms.append(term)
+    phrase = " ".join(terms).strip()
+    if len(terms) < 2:
+        phrase = ""
+    return terms, phrase
+
+
+def _normalize_snippet(text, max_chars=240):
+    clean = " ".join(str(text or "").split())
+    max_len = max(40, int(max_chars or 240))
+    if len(clean) <= max_len:
+        return clean
+    return clean[: max_len - 1].rstrip() + "..."
+
+
+def _score_lcm_keyword_matches(conv_id, matches, keywords, phrase):
+    raw_count = len(matches)
+    matched_keywords = sorted({
+        str(m.get("keyword_matched") or "")
+        for m in matches
+        if m.get("match_type") == "term" and m.get("keyword_matched")
+    }, key=lambda s: s.lower())
+    phrase_hits = sum(1 for m in matches if m.get("match_type") == "phrase")
+    if phrase_hits > 0:
+        by_lower = {k.lower(): k for k in matched_keywords}
+        for kw in keywords:
+            by_lower.setdefault(str(kw).lower(), str(kw))
+        matched_keywords = sorted(by_lower.values(), key=lambda s: s.lower())
+    capped_count = min(raw_count, 40)
+    all_keywords = bool(keywords) and (
+        phrase_hits > 0
+        or len({k.lower() for k in matched_keywords}) >= len({k.lower() for k in keywords})
+    )
+    components = {
+        "unique_keyword_score": 2.0 * len(matched_keywords),
+        "all_keywords_bonus": 2.5 if all_keywords else 0.0,
+        "phrase_bonus": (3.0 + math.log1p(min(phrase_hits, 10))) if phrase_hits > 0 else 0.0,
+        "capped_match_score": math.log1p(capped_count),
+        "giant_conversation_penalty": 0.0,
+    }
+    if raw_count > 200:
+        components["giant_conversation_penalty"] = min(2.0, math.log1p(raw_count / 200.0))
+    score = (
+        components["unique_keyword_score"]
+        + components["all_keywords_bonus"]
+        + components["phrase_bonus"]
+        + components["capped_match_score"]
+        - components["giant_conversation_penalty"]
+    )
+    return score, {
+        "matched_keywords": matched_keywords,
+        "phrase": phrase or None,
+        "phrase_hits": phrase_hits,
+        "all_keywords_matched": all_keywords,
+        "raw_match_count": raw_count,
+        "capped_match_count": capped_count,
+        "match_cap": 40,
+        "components": {k: round(v, 4) for k, v in components.items()},
+        "score_formula": "unique_keyword_score + all_keywords_bonus + phrase_bonus + capped_match_score - giant_conversation_penalty",
+    }
+
+
+def _pick_best_keyword_snippet(matches):
+    if not matches:
+        return ""
+    def key(m):
+        ts = _coerce_timestamp(m.get("created_at")) or 0.0
+        return (
+            1 if m.get("match_type") == "phrase" else 0,
+            1 if m.get("all_keywords_in_message") else 0,
+            ts,
+        )
+    best = max(matches, key=key)
+    return _normalize_snippet(best.get("snippet"), 120)
 
 
 def _chunked(values, size=900):
@@ -1269,41 +1356,88 @@ def do_hybrid_search(
     )
 
     # LCM keyword search
-    keywords = [w.strip() for w in query.split() if len(w.strip()) >= 3]
+    keywords, phrase = _keyword_terms(query)
     conn = sqlite3.connect(LCM_DB)
     conn.row_factory = sqlite3.Row
     gconn = sqlite3.connect(GEO_DB)
     gconn.row_factory = sqlite3.Row
 
     results_by_conv = defaultdict(list)
+    lower_keywords = [kw.lower() for kw in keywords]
     for kw in keywords:
         keyword_limit = (
-            max(5000, safe_top_n * 200)
+            max(5000, safe_top_n * 400)
             if updated_after_ts is not None or updated_before_ts is not None
-            else max(50, safe_top_n * 80)
+            else max(2000, safe_top_n * 300)
+        )
+        kw_lower = kw.lower()
+        cur = conn.execute('''
+            SELECT message_id, conversation_id, role,
+                   CASE
+                     WHEN INSTR(LOWER(content), ?) > 100
+                     THEN SUBSTR(content, INSTR(LOWER(content), ?) - 100, 260)
+                     ELSE SUBSTR(content, 1, 260)
+                   END AS snippet,
+                   token_count, created_at
+            FROM messages
+            WHERE LOWER(content) LIKE ?
+            ORDER BY created_at DESC
+            LIMIT ?
+        ''', [kw_lower, kw_lower, f'%{kw_lower}%', keyword_limit])
+        for r in cur.fetchall():
+            if not _timestamp_in_bounds(r['created_at'], updated_after_ts, updated_before_ts):
+                continue
+            snippet_lower = str(r["snippet"] or "").lower()
+            results_by_conv[r['conversation_id']].append({
+                'message_id': r['message_id'],
+                'role': r['role'],
+                'snippet': r['snippet'],
+                'keyword_matched': kw,
+                'match_type': 'term',
+                'all_keywords_in_message': bool(lower_keywords) and all(k in snippet_lower for k in lower_keywords),
+                'created_at': r['created_at']
+            })
+    if phrase:
+        phrase_lower = phrase.lower()
+        phrase_limit = (
+            max(5000, safe_top_n * 400)
+            if updated_after_ts is not None or updated_before_ts is not None
+            else max(2000, safe_top_n * 300)
         )
         cur = conn.execute('''
             SELECT message_id, conversation_id, role,
-                   SUBSTR(content, 1, 120) as snippet, token_count, created_at
+                   CASE
+                     WHEN INSTR(LOWER(content), ?) > 100
+                     THEN SUBSTR(content, INSTR(LOWER(content), ?) - 100, 260)
+                     ELSE SUBSTR(content, 1, 260)
+                   END AS snippet,
+                   token_count, created_at
             FROM messages
-            WHERE content LIKE ?
+            WHERE LOWER(content) LIKE ?
             ORDER BY created_at DESC
             LIMIT ?
-        ''', [f'%{kw}%', keyword_limit])
+        ''', [phrase_lower, phrase_lower, f'%{phrase_lower}%', phrase_limit])
         for r in cur.fetchall():
             if not _timestamp_in_bounds(r['created_at'], updated_after_ts, updated_before_ts):
                 continue
             results_by_conv[r['conversation_id']].append({
                 'message_id': r['message_id'],
                 'role': r['role'],
-                'snippet': r['snippet'][:100],
-                'keyword_matched': kw,
+                'snippet': r['snippet'],
+                'keyword_matched': phrase,
+                'match_type': 'phrase',
+                'all_keywords_in_message': True,
                 'created_at': r['created_at']
             })
     conn.close()
 
     scored = []
     for conv_id, matches in results_by_conv.items():
+        dedup = {}
+        for m in matches:
+            key = (m.get('message_id'), m.get('keyword_matched'), m.get('match_type'))
+            dedup[key] = m
+        matches = list(dedup.values())
         most_recent = max(
             matches,
             key=lambda m: _coerce_timestamp(m.get('created_at')) or float("-inf"),
@@ -1312,17 +1446,17 @@ def do_hybrid_search(
             continue
         recency = _recency_meta(most_recent, half_life_days)
         activity = _activity_meta(most_recent, half_life_days)
-        raw_score = (
-            2.0 * len(set(m['keyword_matched'] for m in matches))
-            + math.log1p(len(matches))
-        )
+        raw_score, keyword_debug = _score_lcm_keyword_matches(conv_id, matches, keywords, phrase)
         scored.append({
             'conv_id': conv_id,
             'match_count': len(matches),
-            'unique_keywords_matched': len(set(m['keyword_matched'] for m in matches)),
+            'unique_keywords_matched': len(keyword_debug["matched_keywords"]),
+            'matched_keywords': keyword_debug["matched_keywords"],
+            'phrase_matched': bool(keyword_debug["phrase_hits"]),
             'total_matches': len(matches),
             'raw_score': round(raw_score, 4),
-            'best_snippet': matches[0]['snippet'][:80],
+            'best_snippet': _pick_best_keyword_snippet(matches),
+            'keyword_debug': keyword_debug,
             'most_recent': most_recent,
             'last_update_ts': recency["last_update_ts"],
             'source_timestamp': recency["source_timestamp"],
@@ -1342,7 +1476,15 @@ def do_hybrid_search(
     if boost > 0.0:
         _rerank_rows_by_recency(scored, "raw_score", "most_recent", boost, half_life_days)
     else:
-        scored.sort(key=lambda x: (x['unique_keywords_matched'], x['total_matches']), reverse=True)
+        scored.sort(
+            key=lambda x: (
+                _coerce_float(x.get('raw_score'), 0.0),
+                1 if x.get('phrase_matched') else 0,
+                x['unique_keywords_matched'],
+                _coerce_timestamp(x.get('most_recent')) or 0.0,
+            ),
+            reverse=True,
+        )
         for row in scored:
             row["final_score"] = row["raw_score"]
     lcm_results = scored[:safe_top_n]
@@ -2614,7 +2756,9 @@ async def call_tool(name, arguments):
                 )
                 lines.append(
                     f"  {i}. conv_{c['conv_id']} | {score_part}{c['unique_keywords_matched']} kw matched "
-                    f"| {c['total_matches']} total hits | updated={c.get('recency_label', 'unknown')}"
+                    f"| score={c.get('raw_score')} | hits={c['total_matches']} "
+                    f"(cap={c.get('keyword_debug', {}).get('capped_match_count', c['total_matches'])}) "
+                    f"| phrase={bool(c.get('phrase_matched'))} | updated={c.get('recency_label', 'unknown')}"
                 )
                 lines.append(f"     \"{c['best_snippet']}\"")
             lines.append("")

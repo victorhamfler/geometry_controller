@@ -827,6 +827,16 @@ geometry-hybrid__hybrid_search(
 
 Returns combined results from both systems with recommendation. Result rows include original relevance (`total_score`), optional blended ordering score (`final_score`), and source-time recency metadata (`source_timestamp`, `timestamp_source`, `last_updated`, `age_days`, `recency_score`, `recency_label`).
 
+LCM keyword results use keyword ranking v2:
+- meaningful query terms are matched case-insensitively
+- multi-term queries add an exact phrase pass
+- all-term matches and phrase matches receive explicit boosts
+- raw hit-count influence is capped at 40 matches
+- conversations with more than 200 keyword hits receive a small volume penalty
+- snippets are centered around the matched term or phrase
+
+LCM result rows include `matched_keywords`, `phrase_matched`, and `keyword_debug` so an agent can see why a conversation ranked where it did.
+
 ### `geometry-hybrid__retrieval_feedback`
 
 Record explicit feedback for a retrieval result from `hybrid_search`.

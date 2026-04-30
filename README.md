@@ -8,6 +8,11 @@ Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geomet
   - `recency_boost` blends source-time freshness with relevance while preserving the original `total_score`
   - `recency_half_life_days` tunes freshness decay
   - `max_age_days`, `updated_within_days`, `min_age_days`, `updated_after`, `updated_before`, `date_from`, and `date_to` filter results by source time
+- Hybrid search LCM keyword ranking v2:
+  - tokenized case-insensitive term matching plus exact phrase matching
+  - all-term and phrase hits are boosted ahead of broad single-term matches
+  - raw hit counts are capped and very large conversations are lightly penalized so volume does not dominate relevance
+  - LCM rows expose `matched_keywords`, `phrase_matched`, and `keyword_debug`
 - Geometry recency now uses source timestamps instead of polling timestamps:
   - LCM message time via `memory_nodes.lcm_id` first
   - LCM conversation creation time for `conv_*` fallback
@@ -385,6 +390,28 @@ Example:
   "activity_within_days": 14
 }
 ```
+
+## Hybrid Search Keyword Ranking
+
+The LCM side of `hybrid_search` uses an explainable keyword ranker before merging with geometry results.
+
+For multi-term queries it now:
+
+- searches each meaningful term case-insensitively
+- adds an exact phrase pass for the normalized query terms
+- boosts conversations that match every term
+- boosts exact phrase hits
+- caps the raw-hit contribution at 40 matches
+- applies a small penalty to conversations with more than 200 keyword hits
+- centers snippets around the matched term or phrase
+
+LCM result rows include:
+
+- `matched_keywords`: query terms represented by the result
+- `phrase_matched`: whether the exact normalized phrase matched
+- `keyword_debug`: score components, raw/capped match counts, and phrase hit count
+
+This keeps keyword search precise for exact queries such as `"CLGK backpressure"` without letting long historical conversations win only because they contain thousands of incidental mentions.
 
 ## Conversation Content Filters
 
