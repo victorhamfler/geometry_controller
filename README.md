@@ -386,6 +386,18 @@ Example:
 }
 ```
 
+## Conversation Content Filters
+
+`conversation_content` accepts the same workflow-oriented filters used by `hybrid_search` for multi-branch content retrieval:
+
+- `state`: lifecycle-state filter such as `ACTIVE`, `STABLE`, `FORMING`, or a list
+- `state_group`: `working`, `settled`, `dormant`, or `all`
+- `activity_state`: `recent` or `stale`, based on latest source activity
+- `activity_within_days`: activity window; default `14`
+- `fallback_when_empty`: default `true`; empty `ACTIVE` multi-branch requests explicitly fall back to `state_group="working"`
+
+Fallback is reported in the response under `fallback`, and returned branches include `activity_state`, `activity_label`, and `last_source_timestamp`. If a summaries-only branch has no summaries, the tool falls back to messages for that branch and marks it with `summary_empty_used_messages_fallback`.
+
 ## One-command maintenance (Lossless cleanup + Geometry sync)
 
 Use this wrapper when testing/maintaining Lossless-Claw cleanup together with Geometry DAG integrity:

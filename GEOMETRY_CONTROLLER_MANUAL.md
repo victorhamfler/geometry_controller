@@ -605,6 +605,20 @@ Supported hybrid-search filters:
 
 Recency-aware result rows include `source_timestamp`, `timestamp_source`, `last_updated`, `age_days`, `recency_score`, and `recency_label`. Activity-aware rows also include `last_source_timestamp`, `last_source_updated`, `last_timestamp_source`, `activity_age_days`, `activity_score`, `activity_label`, and `activity_state`. `base_score` is the original semantic/trust score and `ranking_score` is the presented ordering score; the legacy `retrieval_kappa` field remains as a compatibility alias for `base_score`.
 
+### Activity-Aware Content Retrieval
+
+The MCP `conversation_content` tool supports the same branch-targeting vocabulary for multi-branch reads:
+
+| Parameter | Meaning |
+|---|---|
+| `state` | Optional lifecycle state or list of states |
+| `state_group` | `working`, `settled`, `dormant`, or `all` |
+| `activity_state` | `recent`, `stale`, or `dormant` latest-source-activity filter |
+| `activity_within_days` | Activity window; default `14` |
+| `fallback_when_empty` | Default `true`; empty `ACTIVE` requests explicitly fall back to `state_group="working"` |
+
+The fallback is never silent. Responses include a `fallback` object with the original filter, replacement filter, and reason. Branch rows include `last_source_timestamp`, `last_source_updated`, `activity_age_days`, `activity_label`, and `activity_state`. If a summaries-only branch has no summaries, `conversation_content` falls back to messages for that branch and adds `summary_empty_used_messages_fallback` to the branch warning.
+
 ### CSD Scoring (On New Message)
 
 When a new message arrives, the `CSDScorer` scores it against each candidate branch:

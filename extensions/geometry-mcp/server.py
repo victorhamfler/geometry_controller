@@ -338,7 +338,7 @@ def _activity_state_for_ts(ts, activity_within_days=14.0, now_ts=None):
     return "recent" if t >= now - (days * 86400.0) else "stale"
 
 
-def _load_geometry_recency_metadata(gc):
+def _load_geometry_recency_metadata(gc=None, branch_rows=None):
     """
     Return branch_id -> source-time metadata.
 
@@ -348,10 +348,11 @@ def _load_geometry_recency_metadata(gc):
     fall back to geometry timestamps.
     """
     out = {}
-    try:
-        branch_rows = gc.db.list_branch_scalars()
-    except Exception:
-        branch_rows = []
+    if branch_rows is None:
+        try:
+            branch_rows = gc.db.list_branch_scalars()
+        except Exception:
+            branch_rows = []
     branch_ids = [str(r.get("branch_id") or "") for r in branch_rows if str(r.get("branch_id") or "").strip()]
     branch_set = set(branch_ids)
     fallback_update = {
@@ -1887,12 +1888,150 @@ def _get_branch_lineage_content(gdb_conn, lcm_conn, branch_id, content_type, max
 
     return entries[:max_entries], meta
 
-def do_conversation_content(branch_id=None, state=None, content_type="summaries", max_entries=100, max_chars=250):
+def _conversation_branch_candidates(gdb, content_type, state=None, state_group=None, activity_state=None, activity_within_days=None):
+    safe_content = str(content_type or "summaries").strip().lower()
+    branch_like = "day_%" if safe_content == "logs" else "conv_%"
+    rows = gdb.execute(
+        "SELECT branch_id, state, regime, node_count, last_update_ts "
+        "FROM branch_states WHERE branch_id LIKE ? ORDER BY node_count DESC",
+        (branch_like,),
+    ).fetchall()
+    branch_rows = [dict(r) for r in rows]
+    include_states = _state_filter_from_group(state=state, state_group=state_group)
+    if include_states:
+        include_set = set(include_states)
+        branch_rows = [r for r in branch_rows if str(r.get("state") or "").upper() in include_set]
+
+    normalized_state_group = str(state_group or "all").strip().lower() or "all"
+    if normalized_state_group not in ("all", "working", "settled", "dormant"):
+        normalized_state_group = "all"
+    normalized_activity_state, activity_days, activity_after_ts, activity_before_ts = _activity_filter_from_args(
+        activity_state=activity_state,
+        activity_within_days=activity_within_days,
+        state_group=normalized_state_group,
+    )
+    recency_meta = _load_geometry_recency_metadata(branch_rows=branch_rows)
+    if activity_after_ts is not None or activity_before_ts is not None:
+        branch_rows = [
+            r for r in branch_rows
+            if _timestamp_in_bounds(
+                (recency_meta.get(str(r.get("branch_id") or ""), {}) or {}).get("last_source_timestamp")
+                or r.get("last_update_ts"),
+                activity_after_ts,
+                activity_before_ts,
+            )
+        ]
+
+    return branch_rows, recency_meta, {
+        "state": include_states or None,
+        "state_group": normalized_state_group,
+        "activity_state": normalized_activity_state,
+        "activity_within_days": activity_days,
+        "activity_after_ts": activity_after_ts,
+        "activity_before_ts": activity_before_ts,
+        "activity_after": _recency_meta(activity_after_ts)["last_updated"] if activity_after_ts is not None else None,
+        "activity_before": _recency_meta(activity_before_ts)["last_updated"] if activity_before_ts is not None else None,
+    }
+
+
+def _conversation_fallback_args(state, state_group, activity_state, fallback_when_empty):
+    if not fallback_when_empty:
+        return None
+    explicit_state = _normalize_state_filter(state)
+    group = str(state_group or "").strip().lower()
+    activity = str(activity_state or "").strip().lower()
+    if explicit_state == ["ACTIVE"] and not group and not activity:
+        return {
+            "state": None,
+            "state_group": "working",
+            "activity_state": None,
+            "reason": "active_empty_used_working_group",
+        }
+    if explicit_state == ["ACTIVE"] and activity in ("recent", "active", "current"):
+        return {
+            "state": None,
+            "state_group": "working",
+            "activity_state": activity_state,
+            "reason": "active_recent_empty_used_working_group",
+        }
+    return None
+
+
+def _build_conversation_content_results(
+    gdb,
+    lcm,
+    branches,
+    content_type,
+    max_entries,
+    max_chars,
+    recency_meta=None,
+    filters=None,
+):
+    results = []
+    if not branches:
+        return results
+    per_branch = max(max_entries // len(branches), 3)
+    for b in branches:
+        bid = str(b["branch_id"])
+        if bid.startswith("day_") or content_type == "logs":
+            entries = _get_daily_log_content(gdb, bid, per_branch, max_chars)
+            resolution_meta = {
+                "resolution_mode": "daily_log",
+                "resolved_conversation_ids": [],
+            }
+        else:
+            entries, resolution_meta = _get_branch_lineage_content(
+                gdb, lcm, bid, content_type, per_branch, max_chars
+            )
+            if not entries and content_type == "summaries":
+                entries, resolution_meta = _get_branch_lineage_content(
+                    gdb, lcm, bid, "messages", per_branch, max_chars
+                )
+                if entries:
+                    _append_resolution_warning(resolution_meta, "summary_empty_used_messages_fallback")
+        activity = _activity_meta(
+            (recency_meta or {}).get(bid, {}).get("last_source_timestamp")
+            or b["last_update_ts"]
+        )
+        results.append({
+            "branch_id": bid,
+            "state": b["state"],
+            "regime": b["regime"],
+            "last_source_timestamp": activity["last_source_timestamp"],
+            "last_source_updated": activity["last_source_updated"],
+            "activity_age_days": activity["activity_age_days"],
+            "activity_label": activity["activity_label"],
+            "activity_state": _activity_state_for_ts(
+                activity["last_source_timestamp"],
+                (filters or {}).get("activity_within_days", 14.0),
+            ),
+            "entries_returned": len(entries),
+            "resolution_mode": resolution_meta.get("resolution_mode", "unknown"),
+            "resolved_conversation_ids": resolution_meta.get("resolved_conversation_ids", []),
+            "warning": resolution_meta.get("warning"),
+            "content": entries
+        })
+    return results
+
+
+def do_conversation_content(
+    branch_id=None,
+    state=None,
+    content_type="summaries",
+    max_entries=100,
+    max_chars=250,
+    state_group=None,
+    activity_state=None,
+    activity_within_days=None,
+    fallback_when_empty=True,
+):
     """Retrieve actual conversation text from LCM for geometry-identified branches.
 
     Modes:
       - Single branch:   branch_id="conv_148"
       - By state:        state="ACTIVE" | "STABLE" | "FORMING" | "ALL"
+      - By group:        state_group="working" | "settled" | "all"
+      - By activity:     activity_state="recent" | "stale"
       - All branches:    no filters (implicit state="ALL")
     """
     gdb = sqlite3.connect(GEO_DB)
@@ -1918,10 +2057,23 @@ def do_conversation_content(branch_id=None, state=None, content_type="summaries"
             entries, resolution_meta = _get_branch_lineage_content(
                 gdb, lcm, branch_id, content_type, max_entries, max_chars
             )
+            if not entries and content_type == "summaries":
+                entries, resolution_meta = _get_branch_lineage_content(
+                    gdb, lcm, branch_id, "messages", max_entries, max_chars
+                )
+                if entries:
+                    _append_resolution_warning(resolution_meta, "summary_empty_used_messages_fallback")
+        branch_meta = _load_geometry_recency_metadata(branch_rows=[dict(b)]).get(str(branch_id), {})
+        activity = _activity_meta(branch_meta.get("last_source_timestamp") or b["last_update_ts"])
         results.append({
             "branch_id": branch_id,
             "state": b["state"],
             "regime": b["regime"],
+            "last_source_timestamp": activity["last_source_timestamp"],
+            "last_source_updated": activity["last_source_updated"],
+            "activity_age_days": activity["activity_age_days"],
+            "activity_label": activity["activity_label"],
+            "activity_state": _activity_state_for_ts(activity["last_source_timestamp"]),
             "entries_returned": len(entries),
             "resolution_mode": resolution_meta.get("resolution_mode", "unknown"),
             "resolved_conversation_ids": resolution_meta.get("resolved_conversation_ids", []),
@@ -1929,59 +2081,92 @@ def do_conversation_content(branch_id=None, state=None, content_type="summaries"
             "content": entries
         })
     else:
-        # Multi-branch mode (filtered by state or ALL)
-        filter_state = (state or "ALL").upper()
-        if content_type == "logs":
-            if filter_state != "ALL":
-                branches = gdb.execute(
-                    "SELECT branch_id, state, regime FROM branch_states "
-                    "WHERE state = ? AND branch_id LIKE 'day_%' ORDER BY node_count DESC",
-                    (filter_state,),
-                ).fetchall()
-            else:
-                branches = gdb.execute(
-                    "SELECT branch_id, state, regime FROM branch_states "
-                    "WHERE branch_id LIKE 'day_%' ORDER BY node_count DESC"
-                ).fetchall()
-        else:
-            if filter_state != "ALL":
-                branches = gdb.execute(
-                    "SELECT branch_id, state, regime FROM branch_states "
-                    "WHERE state = ? AND branch_id LIKE 'conv_%' ORDER BY node_count DESC",
-                    (filter_state,),
-                ).fetchall()
-            else:
-                branches = gdb.execute(
-                    "SELECT branch_id, state, regime FROM branch_states "
-                    "WHERE branch_id LIKE 'conv_%' ORDER BY node_count DESC"
-                ).fetchall()
+        # Multi-branch mode (filtered by state/group/activity or ALL)
+        branches, recency_meta, filters = _conversation_branch_candidates(
+            gdb,
+            content_type,
+            state=state,
+            state_group=state_group,
+            activity_state=activity_state,
+            activity_within_days=activity_within_days,
+        )
+        fallback = None
+        if not branches:
+            fallback_args = _conversation_fallback_args(
+                state,
+                state_group,
+                activity_state,
+                bool(fallback_when_empty),
+            )
+            if fallback_args:
+                branches, recency_meta, filters = _conversation_branch_candidates(
+                    gdb,
+                    content_type,
+                    state=fallback_args["state"],
+                    state_group=fallback_args["state_group"],
+                    activity_state=fallback_args["activity_state"],
+                    activity_within_days=activity_within_days,
+                )
+                fallback = {
+                    "used": bool(branches),
+                    "reason": fallback_args["reason"],
+                    "from": {
+                        "state": state or "ALL",
+                        "state_group": state_group or "all",
+                        "activity_state": activity_state or "all",
+                    },
+                    "to": {
+                        "state": fallback_args["state"] or "ALL",
+                        "state_group": fallback_args["state_group"],
+                        "activity_state": fallback_args["activity_state"] or "all",
+                    },
+                }
 
         if not branches:
             gdb.close(); lcm.close()
-            return {"error": f"No branches found{f' with state={state}' if state else ''}"}
+            return {
+                "error": "No branches found for requested filters",
+                "filters": filters,
+                "fallback": fallback,
+            }
 
-        per_branch = max(max_entries // len(branches), 3)
-        for b in branches:
-            if str(b["branch_id"]).startswith("day_") or content_type == "logs":
-                entries = _get_daily_log_content(gdb, b["branch_id"], per_branch, max_chars)
-                resolution_meta = {
-                    "resolution_mode": "daily_log",
-                    "resolved_conversation_ids": [],
-                }
-            else:
-                entries, resolution_meta = _get_branch_lineage_content(
-                    gdb, lcm, b["branch_id"], content_type, per_branch, max_chars
+        results = _build_conversation_content_results(
+            gdb, lcm, branches, content_type, max_entries, max_chars, recency_meta, filters
+        )
+
+        if sum(r["entries_returned"] for r in results) == 0 and not fallback:
+            fallback_args = _conversation_fallback_args(
+                state,
+                state_group,
+                activity_state,
+                bool(fallback_when_empty),
+            )
+            if fallback_args:
+                branches, recency_meta, filters = _conversation_branch_candidates(
+                    gdb,
+                    content_type,
+                    state=fallback_args["state"],
+                    state_group=fallback_args["state_group"],
+                    activity_state=fallback_args["activity_state"],
+                    activity_within_days=activity_within_days,
                 )
-            results.append({
-                "branch_id": b["branch_id"],
-                "state": b["state"],
-                "regime": b["regime"],
-                "entries_returned": len(entries),
-                "resolution_mode": resolution_meta.get("resolution_mode", "unknown"),
-                "resolved_conversation_ids": resolution_meta.get("resolved_conversation_ids", []),
-                "warning": resolution_meta.get("warning"),
-                "content": entries
-            })
+                fallback = {
+                    "used": bool(branches),
+                    "reason": fallback_args["reason"] + "_after_empty_content",
+                    "from": {
+                        "state": state or "ALL",
+                        "state_group": state_group or "all",
+                        "activity_state": activity_state or "all",
+                    },
+                    "to": {
+                        "state": fallback_args["state"] or "ALL",
+                        "state_group": fallback_args["state_group"],
+                        "activity_state": fallback_args["activity_state"] or "all",
+                    },
+                }
+                results = _build_conversation_content_results(
+                    gdb, lcm, branches, content_type, max_entries, max_chars, recency_meta, filters
+                )
 
     gdb.close()
     lcm.close()
@@ -2005,6 +2190,8 @@ def do_conversation_content(branch_id=None, state=None, content_type="summaries"
         "mode": "single" if branch_id else "multi",
         "content_type": content_type,
         "state_filter": state or "ALL",
+        "filters": {} if branch_id else filters,
+        "fallback": None if branch_id else fallback,
         "branches_returned": len(results),
         "total_entries": total_entries,
         "results": results
@@ -2273,7 +2460,7 @@ async def list_tools():
             description=(
                 "Retrieve actual conversation text from the LCM database for geometry-identified branches. "
                 "Bridges the gap between geometry metadata (branch IDs, scores) and real text content. "
-                "Modes: (1) single branch by ID, (2) all branches filtered by state (ACTIVE/STABLE/FORMING/ALL). "
+                "Modes: (1) single branch by ID, (2) all branches filtered by state, state_group, or latest activity. "
                 "Default returns summaries only to keep output compact."
             ),
             inputSchema={
@@ -2284,9 +2471,27 @@ async def list_tools():
                         "description": "Single branch ID like 'conv_148'. If set, state filter is ignored."
                     },
                     "state": {
-                        "type": "string",
-                        "enum": ["ACTIVE", "STABLE", "FORMING", "ALL"],
+                        "type": ["string", "array"],
+                        "items": {"type": "string"},
                         "description": "Filter by branch lifecycle state. Default: ALL."
+                    },
+                    "state_group": {
+                        "type": "string",
+                        "enum": ["all", "working", "settled", "dormant"],
+                        "description": "Convenience filter. working=recent FORMING/ACTIVE/REACTIVATING; settled/dormant=older STABLE."
+                    },
+                    "activity_state": {
+                        "type": "string",
+                        "enum": ["recent", "stale", "dormant", "all"],
+                        "description": "Filter by latest source activity, separate from geometric lifecycle state."
+                    },
+                    "activity_within_days": {
+                        "type": "number",
+                        "description": "Window for activity_state/state_group freshness checks. Default 14."
+                    },
+                    "fallback_when_empty": {
+                        "type": "boolean",
+                        "description": "When true, empty ACTIVE multi-branch requests fall back explicitly to state_group=working. Default true."
                     },
                     "content_type": {
                         "type": "string",
@@ -2777,14 +2982,33 @@ async def call_tool(name, arguments):
         elif name == "conversation_content":
             branch_id = arguments.get("branch_id")
             state = arguments.get("state")
+            state_group = arguments.get("state_group")
+            activity_state = arguments.get("activity_state")
+            activity_within_days = arguments.get("activity_within_days")
+            fallback_when_empty = arguments.get("fallback_when_empty", True)
             content_type = arguments.get("content_type", "summaries")
             max_entries = arguments.get("max_entries", 100)
             max_chars = arguments.get("max_chars", 250)
 
-            result = do_conversation_content(branch_id, state, content_type, max_entries, max_chars)
+            result = do_conversation_content(
+                branch_id,
+                state,
+                content_type,
+                max_entries,
+                max_chars,
+                state_group=state_group,
+                activity_state=activity_state,
+                activity_within_days=activity_within_days,
+                fallback_when_empty=fallback_when_empty,
+            )
 
             if 'error' in result:
-                return [TextContent(type="text", text=f"Error: {result['error']}")]
+                extra = ""
+                if result.get("filters"):
+                    extra += f"\nFilters: {json.dumps(result.get('filters'), ensure_ascii=False)}"
+                if result.get("fallback"):
+                    extra += f"\nFallback: {json.dumps(result.get('fallback'), ensure_ascii=False)}"
+                return [TextContent(type="text", text=f"Error: {result['error']}{extra}")]
 
             lines = [
                 f" Conversation Content",
@@ -2797,6 +3021,23 @@ async def call_tool(name, arguments):
             ]
             if poll_line:
                 lines.insert(1, poll_line)
+            filters = result.get("filters") or {}
+            if filters:
+                lines.insert(
+                    -1,
+                    "  Filters: "
+                    f"state={filters.get('state') or 'ALL'} "
+                    f"state_group={filters.get('state_group') or 'all'} "
+                    f"activity={filters.get('activity_state') or 'all'} "
+                    f"within_days={filters.get('activity_within_days', 14.0)}"
+                )
+            fallback = result.get("fallback") or {}
+            if fallback.get("used"):
+                lines.insert(
+                    -1,
+                    f"  Fallback: {fallback.get('reason')} "
+                    f"from={fallback.get('from')} to={fallback.get('to')}"
+                )
 
             for r in result['results']:
                 resolved_ids = r.get("resolved_conversation_ids") or []
@@ -2804,7 +3045,8 @@ async def call_tool(name, arguments):
                 lines.append(
                     f"--- {r['branch_id']} | {r['state']}/{r['regime']} | "
                     f"{r['entries_returned']} entries | mode={r.get('resolution_mode','unknown')} "
-                    f"| resolved_conv={resolved_text} ---"
+                    f"| activity={r.get('activity_state','unknown')} "
+                    f"| updated={r.get('activity_label','unknown')} | resolved_conv={resolved_text} ---"
                 )
                 if r.get("warning"):
                     lines.append(f"  [warning] {r['warning']}")

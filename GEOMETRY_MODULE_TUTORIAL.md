@@ -116,6 +116,12 @@ For `backfill_lcm_conversations`:
 - Real mode (`dry_run=false`) needs an embedding provider.
 - If provider is missing, output shows `provider_ready=false`, `aborted=true`, and `preflight_error`.
 
+For `conversation_content`:
+- Use `state_group="working"` to pull text from recent `FORMING`/`ACTIVE`/`REACTIVATING` branches.
+- Use `activity_state="recent"` with `activity_within_days=<N>` to target latest source activity.
+- Keep `fallback_when_empty=true` when asking for `state="ACTIVE"` so empty ACTIVE reads explicitly fall back to working branches.
+- A summaries-only request with no summaries falls back to messages and reports `summary_empty_used_messages_fallback`.
+
 `maintenance_cycle` output includes:
 - `retrieval_feedback_pruned`
 - `retrieval_feedback_pruned_age`
