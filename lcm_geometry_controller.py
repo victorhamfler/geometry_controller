@@ -367,6 +367,9 @@ class RetrievalCandidate:
     trust_score: float
     react_score: float
     total_score: float
+    final_score: float = 0.0
+    recency_score: float = 0.0
+    age_days: Optional[float] = None
 
 
 def _branch_type_profile(cfg: GeometryConfig, branch_type: str) -> dict[str, Any]:
@@ -1376,6 +1379,7 @@ class RetrievalRanker:
                 trust_score=trust,
                 react_score=react,
                 total_score=total,
+                final_score=total,
             ))
 
         results.sort(key=lambda r: r.total_score, reverse=True)
@@ -1655,6 +1659,8 @@ class GeometryDB:
         exclude_states: Optional[set[BranchState | str]] = None,
         branch_ids: Optional[list[str]] = None,
         limit: Optional[int] = None,
+        updated_after_ts: Optional[float] = None,
+        updated_before_ts: Optional[float] = None,
     ) -> list[dict[str, Any]]:
         q = (
             "SELECT "
@@ -1688,6 +1694,12 @@ class GeometryDB:
                 params.extend(clean_ids)
             else:
                 return []
+        if updated_after_ts is not None:
+            clauses.append("COALESCE(last_update_ts, 0.0) >= ?")
+            params.append(float(updated_after_ts))
+        if updated_before_ts is not None:
+            clauses.append("COALESCE(last_update_ts, 0.0) <= ?")
+            params.append(float(updated_before_ts))
         if clauses:
             q += " WHERE " + " AND ".join(clauses)
         q += " ORDER BY COALESCE(last_update_ts, 0.0) DESC"
@@ -3043,6 +3055,11 @@ class GeometryController:
         historical_use:  Optional[dict[str, float]] = None,
         same_project:    Optional[dict[str, float]] = None,
         retrieval_mode:  Optional[str] = None,
+        recency_boost:   float = 0.0,
+        recency_half_life_days: float = 14.0,
+        updated_after_ts: Optional[float] = None,
+        updated_before_ts: Optional[float] = None,
+        recency_timestamps: Optional[dict[str, float]] = None,
     ) -> list[RetrievalCandidate]:
         """
         Returns branches sorted by retrieval priority.
@@ -3052,8 +3069,13 @@ class GeometryController:
         """
         hist_map = historical_use or {}
         proj_map = same_project or {}
+        recency_map = recency_timestamps or {}
         excluded = {BranchState.COLLAPSING, BranchState.SPLIT_PENDING}
-        scalar_rows = self.db.list_branch_scalars(exclude_states=excluded)
+        scalar_rows = self.db.list_branch_scalars(
+            exclude_states=excluded,
+            updated_after_ts=None if recency_map else updated_after_ts,
+            updated_before_ts=None if recency_map else updated_before_ts,
+        )
         if not scalar_rows:
             return []
 
@@ -3061,6 +3083,41 @@ class GeometryController:
         with_mean = [r for r in scalar_rows if int(r.get("has_mean") or 0) == 1]
         if not with_mean:
             return []
+
+        now_ts = time.time()
+        boost = max(0.0, min(1.0, float(recency_boost or 0.0)))
+        half_life_days = max(0.01, float(recency_half_life_days or 14.0))
+
+        def row_effective_ts(row: dict[str, Any]) -> float:
+            bid = str(row.get("branch_id") or "")
+            if bid in recency_map:
+                return float(recency_map.get(bid) or 0.0)
+            return float(row.get("last_update_ts") or 0.0)
+
+        if recency_map and (updated_after_ts is not None or updated_before_ts is not None):
+            filtered_rows = []
+            for row in with_mean:
+                ts = row_effective_ts(row)
+                if updated_after_ts is not None and ts < float(updated_after_ts):
+                    continue
+                if updated_before_ts is not None and ts > float(updated_before_ts):
+                    continue
+                filtered_rows.append(row)
+            with_mean = filtered_rows
+            if not with_mean:
+                return []
+
+        def row_age_days(row: dict[str, Any]) -> Optional[float]:
+            ts = row_effective_ts(row)
+            if ts <= 0.0:
+                return None
+            return max(0.0, (now_ts - ts) / 86400.0)
+
+        def row_recency_score(row: dict[str, Any]) -> float:
+            age = row_age_days(row)
+            if age is None:
+                return 0.0
+            return float(math.pow(2.0, -age / half_life_days))
 
         if len(with_mean) > prefilter_limit:
             def prefilter_score(row: dict[str, Any]) -> float:
@@ -3070,13 +3127,16 @@ class GeometryController:
                 nodes = float(row.get("node_count") or 0.0)
                 h = float(hist_map.get(bid, 0.0))
                 p = float(proj_map.get(bid, 0.0))
-                return (
+                base = (
                     0.45 * h
                     + 0.35 * p
                     + 0.12 * use
                     + 0.05 * coh
                     + 0.03 * math.log1p(max(0.0, nodes))
                 )
+                if boost <= 0.0:
+                    return base
+                return (1.0 - boost) * base + boost * row_recency_score(row)
 
             with_mean.sort(key=prefilter_score, reverse=True)
             shortlist_rows = with_mean[:prefilter_limit]
@@ -3118,7 +3178,7 @@ class GeometryController:
                     node_count=int(row.get("node_count") or 0),
                     split_counter=int(row.get("split_counter") or 0),
                     merge_counter=int(row.get("merge_counter") or 0),
-                    last_update_ts=float(row.get("last_update_ts") or 0.0),
+                    last_update_ts=row_effective_ts(row),
                 )
             )
 
@@ -3132,6 +3192,39 @@ class GeometryController:
             same_project,
             retrieval_mode=retrieval_mode,
         )
+        if boost > 0.0 and ranked:
+            by_last_update = {s.branch_id: float(s.last_update_ts or 0.0) for s in candidates}
+            scores = [float(r.total_score) for r in ranked]
+            lo = min(scores)
+            hi = max(scores)
+            span = hi - lo
+            for r in ranked:
+                ts = by_last_update.get(r.branch_id, 0.0)
+                if ts > 0.0:
+                    age = max(0.0, (now_ts - ts) / 86400.0)
+                    recency = float(math.pow(2.0, -age / half_life_days))
+                    r.age_days = age
+                else:
+                    recency = 0.0
+                    r.age_days = None
+                relevance = 1.0 if span <= 1e-12 else (float(r.total_score) - lo) / span
+                r.recency_score = recency
+                r.final_score = (1.0 - boost) * relevance + boost * recency
+            ranked.sort(
+                key=lambda r: (
+                    float(r.final_score),
+                    float(r.total_score),
+                    by_last_update.get(r.branch_id, 0.0),
+                ),
+                reverse=True,
+            )
+        else:
+            by_last_update = {s.branch_id: float(s.last_update_ts or 0.0) for s in candidates}
+            for r in ranked:
+                ts = by_last_update.get(r.branch_id, 0.0)
+                r.final_score = float(r.total_score)
+                r.recency_score = 0.0
+                r.age_days = max(0.0, (now_ts - ts) / 86400.0) if ts > 0.0 else None
         return ranked[: max(1, int(self.cfg.retrieval_result_limit))]
 
     # ------------------------------------------------------------------

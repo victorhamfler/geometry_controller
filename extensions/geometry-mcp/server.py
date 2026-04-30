@@ -17,10 +17,12 @@ Usage:
 import sys
 import os
 import json
+import math
 import time
 import threading
 import shutil
 import uuid
+from datetime import datetime, timezone
 
 # Resolve workspace/module path  going up from extensions/geometry-mcp/  extensions/  ~/.openclaw/
 SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +36,343 @@ from mcp.types import Tool, TextContent
 import asyncio
 import sqlite3
 from collections import defaultdict
+
+
+def _coerce_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _coerce_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _coerce_timestamp(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000.0
+        return ts
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        ts = float(text)
+        if ts > 10_000_000_000:
+            ts = ts / 1000.0
+        return ts
+    except Exception:
+        pass
+    try:
+        iso = text.replace("Z", "+00:00")
+        if len(iso) == 10 and iso[4] == "-" and iso[7] == "-":
+            iso = iso + "T00:00:00+00:00"
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _date_bounds_from_args(
+    min_age_days=None,
+    max_age_days=None,
+    updated_within_days=None,
+    updated_after=None,
+    updated_before=None,
+    date_from=None,
+    date_to=None,
+):
+    now_ts = time.time()
+    after_ts = _coerce_timestamp(updated_after)
+    before_ts = _coerce_timestamp(updated_before)
+    date_from_ts = _coerce_timestamp(date_from)
+    date_to_ts = _coerce_timestamp(date_to)
+    if date_from_ts is not None:
+        after_ts = max(after_ts, date_from_ts) if after_ts is not None else date_from_ts
+    if date_to_ts is not None:
+        # A bare YYYY-MM-DD should include the whole day.
+        if isinstance(date_to, str) and len(date_to.strip()) == 10:
+            date_to_ts += 86400.0 - 0.001
+        before_ts = min(before_ts, date_to_ts) if before_ts is not None else date_to_ts
+
+    min_age = None if min_age_days in (None, "") else _coerce_float(min_age_days, None)
+    max_age_raw = max_age_days if max_age_days not in (None, "") else updated_within_days
+    max_age = None if max_age_raw in (None, "") else _coerce_float(max_age_raw, None)
+    if max_age is not None and max_age >= 0.0:
+        age_after = now_ts - (max_age * 86400.0)
+        after_ts = max(after_ts, age_after) if after_ts is not None else age_after
+    if min_age is not None and min_age >= 0.0:
+        age_before = now_ts - (min_age * 86400.0)
+        before_ts = min(before_ts, age_before) if before_ts is not None else age_before
+    return after_ts, before_ts
+
+
+def _timestamp_in_bounds(ts, after_ts=None, before_ts=None):
+    if after_ts is None and before_ts is None:
+        return True
+    t = _coerce_timestamp(ts)
+    if t is None:
+        return False
+    if after_ts is not None and t < after_ts:
+        return False
+    if before_ts is not None and t > before_ts:
+        return False
+    return True
+
+
+def _recency_score(ts, half_life_days=14.0, now_ts=None):
+    t = _coerce_timestamp(ts)
+    if t is None:
+        return 0.0
+    now = time.time() if now_ts is None else float(now_ts)
+    age_days = max(0.0, (now - t) / 86400.0)
+    half_life = max(0.01, float(half_life_days or 14.0))
+    return float(2.0 ** (-age_days / half_life))
+
+
+def _recency_meta(ts, half_life_days=14.0, now_ts=None):
+    t = _coerce_timestamp(ts)
+    if t is None:
+        return {
+            "last_update_ts": None,
+            "source_timestamp": None,
+            "last_updated": None,
+            "age_days": None,
+            "recency_score": 0.0,
+            "recency_label": "unknown",
+        }
+    now = time.time() if now_ts is None else float(now_ts)
+    age = max(0.0, (now - t) / 86400.0)
+    if age < 1.0:
+        label = "today"
+    elif age < 2.0:
+        label = "1 day ago"
+    else:
+        label = f"{int(round(age))} days ago"
+    return {
+        "last_update_ts": t,
+        "source_timestamp": t,
+        "last_updated": datetime.fromtimestamp(t, timezone.utc).isoformat().replace("+00:00", "Z"),
+        "age_days": round(age, 2),
+        "recency_score": round(_recency_score(t, half_life_days, now), 4),
+        "recency_label": label,
+    }
+
+
+def _rerank_rows_by_recency(rows, score_key, ts_key, recency_boost=0.0, half_life_days=14.0):
+    boost = max(0.0, min(1.0, _coerce_float(recency_boost, 0.0)))
+    if not rows:
+        return rows
+    scores = [_coerce_float(row.get(score_key), 0.0) for row in rows]
+    lo = min(scores)
+    hi = max(scores)
+    span = hi - lo
+    now_ts = time.time()
+    for row in rows:
+        raw = _coerce_float(row.get(score_key), 0.0)
+        relevance = 1.0 if span <= 1e-12 else (raw - lo) / span
+        recency = _recency_score(row.get(ts_key), half_life_days, now_ts)
+        final = (1.0 - boost) * relevance + boost * recency if boost > 0.0 else raw
+        row["recency_score"] = round(recency, 4)
+        row["final_score"] = round(final, 4)
+    rows.sort(
+        key=lambda r: (
+            _coerce_float(r.get("final_score"), 0.0),
+            _coerce_float(r.get(score_key), 0.0),
+            _coerce_float(_coerce_timestamp(r.get(ts_key)), 0.0),
+        ),
+        reverse=True,
+    )
+    return rows
+
+
+def _chunked(values, size=900):
+    for i in range(0, len(values), size):
+        yield values[i:i + size]
+
+
+def _numeric_lcm_id(value):
+    text = str(value or "").strip()
+    if not text.isdigit():
+        return None
+    try:
+        return int(text)
+    except Exception:
+        return None
+
+
+def _conv_id_from_branch(branch_id):
+    text = str(branch_id or "").strip()
+    if not text.startswith("conv_"):
+        return None
+    suffix = text[5:]
+    if not suffix.isdigit():
+        return None
+    try:
+        return int(suffix)
+    except Exception:
+        return None
+
+
+def _min_ts(current, candidate):
+    ts = _coerce_timestamp(candidate)
+    if ts is None:
+        return current
+    if current is None or ts < current:
+        return ts
+    return current
+
+
+def _set_recency_candidate(out, branch_id, candidate, source):
+    bid = str(branch_id or "")
+    ts = _coerce_timestamp(candidate)
+    if not bid or ts is None:
+        return
+    current = out.get(bid)
+    if current is None or ts < float(current.get("source_timestamp") or 0.0):
+        out[bid] = {
+            "source_timestamp": float(ts),
+            "timestamp_source": source,
+        }
+
+
+def _load_geometry_recency_metadata(gc):
+    """
+    Return branch_id -> source-time metadata.
+
+    branch_states.last_update_ts is an ingestion/maintenance timestamp, so it is
+    too fresh after polling. Prefer actual LCM message/conversation time for
+    conv_* branches, daily_log_content.created_ts for daily logs, and only then
+    fall back to geometry timestamps.
+    """
+    out = {}
+    try:
+        branch_rows = gc.db.list_branch_scalars()
+    except Exception:
+        branch_rows = []
+    branch_ids = [str(r.get("branch_id") or "") for r in branch_rows if str(r.get("branch_id") or "").strip()]
+    branch_set = set(branch_ids)
+    fallback_update = {
+        str(r.get("branch_id") or ""): _coerce_timestamp(r.get("last_update_ts"))
+        for r in branch_rows
+    }
+
+    geo_rows = []
+    try:
+        gconn = sqlite3.connect(GEO_DB)
+        gconn.row_factory = sqlite3.Row
+        try:
+            for r in gconn.execute(
+                """
+                SELECT mn.branch_id, MIN(dl.created_ts) AS ts
+                FROM daily_log_content dl
+                JOIN memory_nodes mn ON mn.id = dl.node_id
+                GROUP BY mn.branch_id
+                """
+            ).fetchall():
+                bid = str(r["branch_id"] or "")
+                if bid:
+                    _set_recency_candidate(out, bid, r["ts"], "daily_log_content")
+        except Exception:
+            pass
+
+        try:
+            geo_rows = gconn.execute(
+                """
+                SELECT branch_id, lcm_id, timestamp
+                FROM memory_nodes
+                WHERE branch_id IS NOT NULL
+                """
+            ).fetchall()
+        except Exception:
+            geo_rows = []
+        finally:
+            gconn.close()
+    except Exception:
+        geo_rows = []
+
+    msg_to_branches = defaultdict(set)
+    geom_min = {}
+    for r in geo_rows:
+        bid = str(r["branch_id"] or "")
+        if not bid:
+            continue
+        geom_min[bid] = _min_ts(geom_min.get(bid), r["timestamp"])
+        mid = _numeric_lcm_id(r["lcm_id"])
+        if mid is not None:
+            msg_to_branches[mid].add(bid)
+
+    try:
+        if os.path.isfile(LCM_DB):
+            lconn = sqlite3.connect(LCM_DB)
+            lconn.row_factory = sqlite3.Row
+            try:
+                message_ids = list(msg_to_branches.keys())
+                for chunk in _chunked(message_ids):
+                    ph = ",".join(["?"] * len(chunk))
+                    rows = lconn.execute(
+                        f"SELECT message_id, created_at FROM messages WHERE message_id IN ({ph})",
+                        tuple(chunk),
+                    ).fetchall()
+                    for row in rows:
+                        ts = _coerce_timestamp(row["created_at"])
+                        if ts is None:
+                            continue
+                        for bid in msg_to_branches.get(int(row["message_id"]), ()):
+                            _set_recency_candidate(out, bid, ts, "lcm_messages")
+
+                missing_conv = {}
+                for bid in branch_ids:
+                    if bid in out:
+                        continue
+                    cid = _conv_id_from_branch(bid)
+                    if cid is not None:
+                        missing_conv[cid] = bid
+                conv_ids = list(missing_conv.keys())
+                for chunk in _chunked(conv_ids):
+                    ph = ",".join(["?"] * len(chunk))
+                    rows = lconn.execute(
+                        f"SELECT conversation_id, created_at FROM conversations WHERE conversation_id IN ({ph})",
+                        tuple(chunk),
+                    ).fetchall()
+                    for row in rows:
+                        bid = missing_conv.get(int(row["conversation_id"]))
+                        if bid:
+                            _set_recency_candidate(out, bid, row["created_at"], "lcm_conversations")
+            finally:
+                lconn.close()
+    except Exception:
+        pass
+
+    for bid in branch_set:
+        if bid not in out:
+            fallback_ts = geom_min.get(bid) or fallback_update.get(bid) or 0.0
+            _set_recency_candidate(out, bid, fallback_ts, "geometry_last_update")
+    return {
+        bid: meta
+        for bid, meta in out.items()
+        if _coerce_timestamp(meta.get("source_timestamp")) is not None
+    }
+
+
+def _load_geometry_recency_timestamps(gc):
+    return {
+        bid: float(meta["source_timestamp"])
+        for bid, meta in _load_geometry_recency_metadata(gc).items()
+    }
 
 # DB paths
 DEFAULT_GEO_DB = os.path.join(OPENCLAW_HOME, 'lcm_geometry.db')
@@ -533,7 +872,18 @@ def _get_daily_log_content(gdb_conn, branch_id, max_entries, max_chars):
     ]
 
 
-def _rank_collapsing_sidecar(gc, q_emb, top_n=5, retrieval_mode="balanced"):
+def _rank_collapsing_sidecar(
+    gc,
+    q_emb,
+    top_n=5,
+    retrieval_mode="balanced",
+    recency_boost=0.0,
+    recency_half_life_days=14.0,
+    updated_after_ts=None,
+    updated_before_ts=None,
+    recency_timestamps=None,
+    recency_metadata=None,
+):
     try:
         import numpy as np
     except Exception:
@@ -544,6 +894,7 @@ def _rank_collapsing_sidecar(gc, q_emb, top_n=5, retrieval_mode="balanced"):
         return []
 
     collapsing = []
+    recency_map = recency_timestamps or {}
     for s in gc.db.all_branches():
         state_val = str(getattr(getattr(s, "state", None), "value", getattr(s, "state", "")) or "")
         if state_val != "COLLAPSING":
@@ -553,6 +904,13 @@ def _rank_collapsing_sidecar(gc, q_emb, top_n=5, retrieval_mode="balanced"):
         mean_vec = getattr(s, "mean_vec", None) or []
         if not mean_vec:
             continue
+        effective_ts = recency_map.get(s.branch_id) or getattr(s, "last_update_ts", None)
+        if not _timestamp_in_bounds(
+            effective_ts,
+            updated_after_ts,
+            updated_before_ts,
+        ):
+            continue
         collapsing.append(s)
 
     if not collapsing:
@@ -560,43 +918,135 @@ def _rank_collapsing_sidecar(gc, q_emb, top_n=5, retrieval_mode="balanced"):
 
     q = np.array(q_emb, dtype=np.float32)
     ranked = gc.ranker.rank(q, collapsing, retrieval_mode=retrieval_mode)
+    boost = max(0.0, min(1.0, _coerce_float(recency_boost, 0.0)))
+    if boost > 0.0 and ranked:
+        now_ts = time.time()
+        by_update = {
+            s.branch_id: float(recency_map.get(s.branch_id) or getattr(s, "last_update_ts", 0.0) or 0.0)
+            for s in collapsing
+        }
+        scores = [float(r.total_score) for r in ranked]
+        lo = min(scores)
+        hi = max(scores)
+        span = hi - lo
+        for r in ranked:
+            ts = by_update.get(r.branch_id, 0.0)
+            relevance = 1.0 if span <= 1e-12 else (float(r.total_score) - lo) / span
+            recency = _recency_score(ts, recency_half_life_days, now_ts)
+            r.recency_score = recency
+            r.final_score = (1.0 - boost) * relevance + boost * recency
+        ranked.sort(
+            key=lambda r: (
+                float(getattr(r, "final_score", r.total_score) or 0.0),
+                float(r.total_score),
+                by_update.get(r.branch_id, 0.0),
+            ),
+            reverse=True,
+        )
     by_id = {s.branch_id: s for s in collapsing}
     out = []
     for r in ranked[:safe_n]:
         s = by_id.get(r.branch_id)
+        meta = (recency_metadata or {}).get(r.branch_id, {})
+        effective_ts = (
+            meta.get("source_timestamp")
+            or recency_map.get(r.branch_id)
+            or (getattr(s, "last_update_ts", None) if s else None)
+        )
+        recency = _recency_meta(
+            effective_ts,
+            recency_half_life_days,
+        )
         out.append({
             "branch_id": r.branch_id,
             "total_score": round(r.total_score, 4),
+            "final_score": round(float(getattr(r, "final_score", r.total_score) or 0.0), 4),
+            "retrieval_kappa": round(r.total_score, 4),
             "sem_score": round(r.sem_score, 4),
             "trust_score": round(r.trust_score, 4),
+            "recency_score": round(float(getattr(r, "recency_score", recency["recency_score"]) or 0.0), 4),
             "nodes": int(getattr(s, "node_count", 0) or 0) if s else 0,
             "coherence": round(float(getattr(s, "coherence", 0.0) or 0.0), 4) if s else 0.0,
             "eff_rank": round(float(getattr(s, "eff_rank", 0.0) or 0.0), 2) if s else 0.0,
             "state": str(getattr(getattr(s, "state", None), "value", getattr(s, "state", "unknown")) or "unknown"),
             "regime": str(getattr(getattr(s, "regime", None), "value", getattr(s, "regime", "unknown")) or "unknown"),
+            "last_update_ts": recency["last_update_ts"],
+            "source_timestamp": recency["source_timestamp"],
+            "timestamp_source": meta.get("timestamp_source") or ("geometry_last_update" if not recency_map.get(r.branch_id) else "source_time"),
+            "last_updated": recency["last_updated"],
+            "age_days": recency["age_days"],
+            "recency_label": recency["recency_label"],
             "note": "excluded_from_primary_rank",
         })
     return out
 
 #  Hybrid search 
-def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
+def do_hybrid_search(
+    query,
+    top_n=5,
+    retrieval_mode="balanced",
+    recency_boost=0.0,
+    recency_half_life_days=14.0,
+    min_age_days=None,
+    max_age_days=None,
+    updated_within_days=None,
+    updated_after=None,
+    updated_before=None,
+    date_from=None,
+    date_to=None,
+):
     gc = get_gc()
     query_id = str(uuid.uuid4())
+    safe_top_n = max(1, _coerce_int(top_n, 5))
+    boost = max(0.0, min(1.0, _coerce_float(recency_boost, 0.0)))
+    half_life_days = max(0.01, _coerce_float(recency_half_life_days, 14.0))
+    updated_after_ts, updated_before_ts = _date_bounds_from_args(
+        min_age_days=min_age_days,
+        max_age_days=max_age_days,
+        updated_within_days=updated_within_days,
+        updated_after=updated_after,
+        updated_before=updated_before,
+        date_from=date_from,
+        date_to=date_to,
+    )
 
     # Encode query
     q_emb = _embed_query(query)
+    geometry_recency_meta = _load_geometry_recency_metadata(gc)
+    geometry_recency_ts = {
+        bid: float(meta["source_timestamp"])
+        for bid, meta in geometry_recency_meta.items()
+    }
 
     # Geometry ranking
-    ranked = gc.rank_retrieval(q_emb, retrieval_mode=retrieval_mode)
+    ranked = gc.rank_retrieval(
+        q_emb,
+        retrieval_mode=retrieval_mode,
+        recency_boost=boost,
+        recency_half_life_days=half_life_days,
+        updated_after_ts=updated_after_ts,
+        updated_before_ts=updated_before_ts,
+        recency_timestamps=geometry_recency_ts,
+    )
     geo_results = []
     implicit_feedback_logged = 0
-    for r in ranked[:top_n]:
+    for r in ranked[:safe_top_n]:
         b = gc.db.load_branch(r.branch_id)
+        recency_info = geometry_recency_meta.get(str(r.branch_id), {})
+        effective_ts = (
+            recency_info.get("source_timestamp")
+            or geometry_recency_ts.get(str(r.branch_id))
+            or (getattr(b, "last_update_ts", None) if b else None)
+        )
+        recency = _recency_meta(
+            effective_ts,
+            half_life_days,
+        )
         try:
             gc.record_retrieval(
                 query_id=query_id,
                 branch_id=str(r.branch_id),
-                score=float(r.total_score),
+                score=float(getattr(r, "final_score", r.total_score) or r.total_score),
                 used=False,
                 corrected=False,
                 expanded=False,
@@ -609,19 +1059,35 @@ def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
         geo_results.append({
             'branch_id': r.branch_id,
             'total_score': round(r.total_score, 4),
+            'final_score': round(float(getattr(r, "final_score", r.total_score) or 0.0), 4),
+            'retrieval_kappa': round(r.total_score, 4),
             'sem_score': round(r.sem_score, 4),
             'trust_score': round(r.trust_score, 4),
+            'recency_score': round(float(getattr(r, "recency_score", recency["recency_score"]) or 0.0), 4),
             'nodes': b.node_count if b else 0,
             'coherence': round(b.coherence, 4) if b else 0,
             'eff_rank': round(b.eff_rank, 2) if b else 0,
             'state': b.state.value if b and b.state else 'unknown',
             'regime': b.regime.value if b and b.regime else 'unknown',
+            'last_update_ts': recency["last_update_ts"],
+            'source_timestamp': recency["source_timestamp"],
+            'timestamp_source': recency_info.get("timestamp_source") or ('source_time' if geometry_recency_ts.get(str(r.branch_id)) else 'geometry_last_update'),
+            'last_updated': recency["last_updated"],
+            'age_days': recency["age_days"],
+            'recency_label': recency["recency_label"],
+            'recency_source': recency_info.get("timestamp_source") or ('source_time' if geometry_recency_ts.get(str(r.branch_id)) else 'geometry_last_update'),
         })
     collapsing_sidecar = _rank_collapsing_sidecar(
         gc,
         q_emb,
-        top_n=top_n,
+        top_n=safe_top_n,
         retrieval_mode=retrieval_mode,
+        recency_boost=boost,
+        recency_half_life_days=half_life_days,
+        updated_after_ts=updated_after_ts,
+        updated_before_ts=updated_before_ts,
+        recency_timestamps=geometry_recency_ts,
+        recency_metadata=geometry_recency_meta,
     )
 
     # LCM keyword search
@@ -633,15 +1099,22 @@ def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
 
     results_by_conv = defaultdict(list)
     for kw in keywords:
+        keyword_limit = (
+            max(5000, safe_top_n * 200)
+            if updated_after_ts is not None or updated_before_ts is not None
+            else max(50, safe_top_n * 80)
+        )
         cur = conn.execute('''
             SELECT message_id, conversation_id, role,
                    SUBSTR(content, 1, 120) as snippet, token_count, created_at
             FROM messages
             WHERE content LIKE ?
             ORDER BY created_at DESC
-            LIMIT 50
-        ''', [f'%{kw}%'])
+            LIMIT ?
+        ''', [f'%{kw}%', keyword_limit])
         for r in cur.fetchall():
+            if not _timestamp_in_bounds(r['created_at'], updated_after_ts, updated_before_ts):
+                continue
             results_by_conv[r['conversation_id']].append({
                 'message_id': r['message_id'],
                 'role': r['role'],
@@ -653,23 +1126,45 @@ def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
 
     scored = []
     for conv_id, matches in results_by_conv.items():
-        most_recent = max(m['created_at'] for m in matches)
+        most_recent = max(
+            matches,
+            key=lambda m: _coerce_timestamp(m.get('created_at')) or float("-inf"),
+        )['created_at']
+        recency = _recency_meta(most_recent, half_life_days)
+        raw_score = (
+            2.0 * len(set(m['keyword_matched'] for m in matches))
+            + math.log1p(len(matches))
+        )
         scored.append({
             'conv_id': conv_id,
             'match_count': len(matches),
             'unique_keywords_matched': len(set(m['keyword_matched'] for m in matches)),
             'total_matches': len(matches),
+            'raw_score': round(raw_score, 4),
             'best_snippet': matches[0]['snippet'][:80],
+            'most_recent': most_recent,
+            'last_update_ts': recency["last_update_ts"],
+            'source_timestamp': recency["source_timestamp"],
+            'timestamp_source': "lcm_messages",
+            'last_updated': recency["last_updated"],
+            'age_days': recency["age_days"],
+            'recency_score': recency["recency_score"],
+            'recency_label': recency["recency_label"],
         })
-    scored.sort(key=lambda x: (x['unique_keywords_matched'], x['total_matches']), reverse=True)
-    lcm_results = scored[:top_n]
+    if boost > 0.0:
+        _rerank_rows_by_recency(scored, "raw_score", "most_recent", boost, half_life_days)
+    else:
+        scored.sort(key=lambda x: (x['unique_keywords_matched'], x['total_matches']), reverse=True)
+        for row in scored:
+            row["final_score"] = row["raw_score"]
+    lcm_results = scored[:safe_top_n]
 
     # Daily log sidecar search (keyword + semantic)
     daily_keyword = []
     for kw in keywords:
         rows = gconn.execute(
             """
-            SELECT mn.branch_id, mn.id AS node_id, mn.timestamp AS created_at,
+            SELECT mn.branch_id, mn.id AS node_id, dl.created_ts AS created_at,
                    SUBSTR(dl.text, 1, 140) AS snippet
             FROM daily_log_content dl
             JOIN memory_nodes mn ON mn.id = dl.node_id
@@ -677,15 +1172,26 @@ def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
             ORDER BY mn.timestamp DESC, mn.rowid DESC
             LIMIT ?
             """,
-            (f"%{kw}%", max(5, int(top_n) * 4)),
+            (f"%{kw}%", max(5, safe_top_n * 4)),
         ).fetchall()
         for r in rows:
+            if not _timestamp_in_bounds(r["created_at"], updated_after_ts, updated_before_ts):
+                continue
+            recency = _recency_meta(r["created_at"], half_life_days)
             daily_keyword.append({
                 "branch_id": r["branch_id"],
                 "node_id": r["node_id"],
                 "created_at": r["created_at"],
                 "keyword_matched": kw,
                 "snippet": r["snippet"],
+                "raw_score": 1.0,
+                "last_update_ts": recency["last_update_ts"],
+                "source_timestamp": recency["source_timestamp"],
+                "timestamp_source": "daily_log_content",
+                "last_updated": recency["last_updated"],
+                "age_days": recency["age_days"],
+                "recency_score": recency["recency_score"],
+                "recency_label": recency["recency_label"],
             })
     # De-duplicate by node_id preserving first hit.
     seen_nodes = set()
@@ -696,7 +1202,8 @@ def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
             continue
         seen_nodes.add(nid)
         dedup_keyword.append(row)
-    daily_keyword = dedup_keyword[:top_n]
+    _rerank_rows_by_recency(dedup_keyword, "raw_score", "created_at", boost, half_life_days)
+    daily_keyword = dedup_keyword[:safe_top_n]
 
     daily_semantic = []
     try:
@@ -704,7 +1211,7 @@ def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
         q = np.array(q_emb, dtype=np.float32)
         rows = gconn.execute(
             """
-            SELECT mn.branch_id, mn.id AS node_id, mn.timestamp AS created_at,
+            SELECT mn.branch_id, mn.id AS node_id, dl.created_ts AS created_at,
                    mn.embedding AS embedding,
                    SUBSTR(dl.text, 1, 140) AS snippet
             FROM daily_log_content dl
@@ -726,15 +1233,26 @@ def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
             if den <= 1e-9:
                 continue
             sim = float(np.dot(q, v) / den)
+            if not _timestamp_in_bounds(r["created_at"], updated_after_ts, updated_before_ts):
+                continue
+            recency = _recency_meta(r["created_at"], half_life_days)
             daily_semantic.append({
                 "branch_id": r["branch_id"],
                 "node_id": r["node_id"],
                 "created_at": r["created_at"],
                 "sem_score": round(sim, 4),
+                "raw_score": sim,
                 "snippet": r["snippet"],
+                "last_update_ts": recency["last_update_ts"],
+                "source_timestamp": recency["source_timestamp"],
+                "timestamp_source": "daily_log_content",
+                "last_updated": recency["last_updated"],
+                "age_days": recency["age_days"],
+                "recency_score": recency["recency_score"],
+                "recency_label": recency["recency_label"],
             })
-        daily_semantic.sort(key=lambda x: x["sem_score"], reverse=True)
-        daily_semantic = daily_semantic[:top_n]
+        _rerank_rows_by_recency(daily_semantic, "raw_score", "created_at", boost, half_life_days)
+        daily_semantic = daily_semantic[:safe_top_n]
     except Exception:
         daily_semantic = []
     finally:
@@ -757,6 +1275,14 @@ def do_hybrid_search(query, top_n=5, retrieval_mode="balanced"):
         'query_id': query_id,
         'query': query,
         'retrieval_mode': retrieval_mode,
+        'recency': {
+            'boost': boost,
+            'half_life_days': half_life_days,
+            'updated_after_ts': updated_after_ts,
+            'updated_before_ts': updated_before_ts,
+            'updated_after': _recency_meta(updated_after_ts, half_life_days)["last_updated"] if updated_after_ts is not None else None,
+            'updated_before': _recency_meta(updated_before_ts, half_life_days)["last_updated"] if updated_before_ts is not None else None,
+        },
         'recommendation': recommendation,
         'feedback': {
             'implicit_logged': implicit_feedback_logged,
@@ -1286,7 +1812,43 @@ async def list_tools():
                         "type": "string",
                         "enum": ["balanced", "factual", "exploratory"],
                         "description": "Geometry ranking mode. factual=more reliability filtering, exploratory=more novelty tolerance."
-                    }
+                    },
+                    "recency_boost": {
+                        "type": "number",
+                        "description": "Optional [0,1] weight that blends freshness into ranking. Default 0 preserves relevance-only ranking."
+                    },
+                    "recency_half_life_days": {
+                        "type": "number",
+                        "description": "Freshness half-life in days for recency_boost. Default 14."
+                    },
+                    "max_age_days": {
+                        "type": "number",
+                        "description": "Only return items updated/created within this many days, e.g. 7 for the last week."
+                    },
+                    "updated_within_days": {
+                        "type": "number",
+                        "description": "Alias for max_age_days; only return items updated/created within this many days."
+                    },
+                    "min_age_days": {
+                        "type": "number",
+                        "description": "Only return items at least this many days old."
+                    },
+                    "updated_after": {
+                        "type": "string",
+                        "description": "Only return items updated/created after this ISO date/time or epoch timestamp."
+                    },
+                    "updated_before": {
+                        "type": "string",
+                        "description": "Only return items updated/created before this ISO date/time or epoch timestamp."
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "description": "Alias for updated_after, convenient for YYYY-MM-DD date ranges."
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "Alias for updated_before, convenient for YYYY-MM-DD date ranges."
+                    },
                 },
                 "required": ["query"]
             }
@@ -1520,7 +2082,22 @@ async def call_tool(name, arguments):
             retrieval_mode = str(arguments.get("retrieval_mode", "balanced") or "balanced").strip().lower()
             if retrieval_mode not in ("balanced", "factual", "exploratory"):
                 retrieval_mode = "balanced"
-            result = do_hybrid_search(query, top_n, retrieval_mode=retrieval_mode)
+            recency_boost = _coerce_float(arguments.get("recency_boost"), 0.0)
+            recency_half_life_days = _coerce_float(arguments.get("recency_half_life_days"), 14.0)
+            result = do_hybrid_search(
+                query,
+                top_n,
+                retrieval_mode=retrieval_mode,
+                recency_boost=recency_boost,
+                recency_half_life_days=recency_half_life_days,
+                min_age_days=arguments.get("min_age_days"),
+                max_age_days=arguments.get("max_age_days"),
+                updated_within_days=arguments.get("updated_within_days"),
+                updated_after=arguments.get("updated_after"),
+                updated_before=arguments.get("updated_before"),
+                date_from=arguments.get("date_from"),
+                date_to=arguments.get("date_to"),
+            )
 
             lines = [
                 f" Hybrid Search: \"{query}\"",
@@ -1531,16 +2108,38 @@ async def call_tool(name, arguments):
             ]
             if poll_line:
                 lines.insert(1, poll_line)
+            recency_meta = result.get("recency", {}) or {}
+            if recency_meta.get("boost", 0.0) or recency_meta.get("updated_after") or recency_meta.get("updated_before"):
+                lines.insert(
+                    -1,
+                    " Recency: "
+                    f"boost={recency_meta.get('boost', 0.0)} "
+                    f"half_life_days={recency_meta.get('half_life_days', 14.0)} "
+                    f"after={recency_meta.get('updated_after') or '-'} "
+                    f"before={recency_meta.get('updated_before') or '-'}"
+                )
             lines.append(" GEOMETRY DB (semantic similarity):")
             for i, r in enumerate(result['geometry']['results'], 1):
-                lines.append(f"  {i}. {r['branch_id']} | sem={r['sem_score']} | trust={r['trust_score']} | nodes={r['nodes']} | eff_rank={r['eff_rank']} | {r['state']}/{r['regime']}")
+                score_part = (
+                    f"final={r.get('final_score')} | " if recency_meta.get("boost", 0.0) else ""
+                )
+                lines.append(
+                    f"  {i}. {r['branch_id']} | {score_part}sem={r['sem_score']} "
+                    f"| trust={r['trust_score']} | recency={r.get('recency_score', 0.0)} "
+                    f"| updated={r.get('recency_label', 'unknown')} | nodes={r['nodes']} "
+                    f"| eff_rank={r['eff_rank']} | {r['state']}/{r['regime']}"
+                )
             lines.append("")
             lines.append(" COLLAPSING SIDECAR (excluded from primary geometry ranking):")
             sidecar_rows = result.get("collapsing_sidecar", {}).get("results", [])
             if sidecar_rows:
                 for i, r in enumerate(sidecar_rows, 1):
+                    score_part = (
+                        f"final={r.get('final_score')} | " if recency_meta.get("boost", 0.0) else ""
+                    )
                     lines.append(
-                        f"  {i}. {r['branch_id']} | sem={r['sem_score']} | trust={r['trust_score']} "
+                        f"  {i}. {r['branch_id']} | {score_part}sem={r['sem_score']} | trust={r['trust_score']} "
+                        f"| recency={r.get('recency_score', 0.0)} | updated={r.get('recency_label', 'unknown')} "
                         f"| nodes={r['nodes']} | eff_rank={r['eff_rank']} | {r['state']}/{r['regime']}"
                     )
             else:
@@ -1548,7 +2147,13 @@ async def call_tool(name, arguments):
             lines.append("")
             lines.append(" LCM (keyword matches):")
             for i, c in enumerate(result['lcm']['conversations'], 1):
-                lines.append(f"  {i}. conv_{c['conv_id']} | {c['unique_keywords_matched']} kw matched | {c['total_matches']} total hits")
+                score_part = (
+                    f"final={c.get('final_score')} | " if recency_meta.get("boost", 0.0) else ""
+                )
+                lines.append(
+                    f"  {i}. conv_{c['conv_id']} | {score_part}{c['unique_keywords_matched']} kw matched "
+                    f"| {c['total_matches']} total hits | updated={c.get('recency_label', 'unknown')}"
+                )
                 lines.append(f"     \"{c['best_snippet']}\"")
             lines.append("")
             lines.append(" DAILY LOGS (sidecar):")
@@ -1557,11 +2162,23 @@ async def call_tool(name, arguments):
             if sem_rows:
                 lines.append("  Semantic:")
                 for i, r in enumerate(sem_rows, 1):
-                    lines.append(f"   {i}. {r['branch_id']} | sem={r['sem_score']} | {r['snippet']}")
+                    score_part = (
+                        f"final={r.get('final_score')} | " if recency_meta.get("boost", 0.0) else ""
+                    )
+                    lines.append(
+                        f"   {i}. {r['branch_id']} | {score_part}sem={r['sem_score']} "
+                        f"| updated={r.get('recency_label', 'unknown')} | {r['snippet']}"
+                    )
             if kw_rows:
                 lines.append("  Keyword:")
                 for i, r in enumerate(kw_rows, 1):
-                    lines.append(f"   {i}. {r['branch_id']} | kw={r['keyword_matched']} | {r['snippet']}")
+                    score_part = (
+                        f"final={r.get('final_score')} | " if recency_meta.get("boost", 0.0) else ""
+                    )
+                    lines.append(
+                        f"   {i}. {r['branch_id']} | {score_part}kw={r['keyword_matched']} "
+                        f"| updated={r.get('recency_label', 'unknown')} | {r['snippet']}"
+                    )
             if not sem_rows and not kw_rows:
                 lines.append("  (no daily-log matches)")
             feedback_meta = result.get("feedback", {}) or {}

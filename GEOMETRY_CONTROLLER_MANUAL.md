@@ -560,6 +560,41 @@ Where:
 - **`trust`** â€” `Îº_coherenceÂ·coherence + Îº_comp_lossÂ·compression_loss - |Îº_topic_drift|Â·topic_drift_density + Îº_ret_errorÂ·retrieval_error`
 - **`react`** â€” recency/reactivation signal (half semantic + history + project signals)
 
+### Source-Time Recency Reranking
+
+The MCP `hybrid_search` tool can optionally blend source-time recency into the returned order. This is intentionally separate from geometry `last_update_ts`, which reflects ingestion, feedback, maintenance, or polling activity.
+
+When `recency_boost > 0`, the MCP layer computes:
+
+```
+recency_score = 2 ** (-age_days / recency_half_life_days)
+final_score   = (1 - recency_boost) * normalized_relevance
+              + recency_boost * recency_score
+```
+
+`total_score` remains the original geometry relevance/trust score. `final_score` is the blended presentation score used for recency-aware ordering.
+
+For geometry branches, source timestamps are resolved in this order:
+
+1. LCM message `created_at` from numeric `memory_nodes.lcm_id`
+2. LCM conversation `created_at` for `conv_*` fallback
+3. `daily_log_content.created_ts` for daily-log branches
+4. Geometry `last_update_ts` only as a final fallback
+
+Supported hybrid-search filters:
+
+| Parameter | Meaning |
+|---|---|
+| `recency_boost` | Blend weight in `[0,1]`; default `0` |
+| `recency_half_life_days` | Freshness decay half-life; default `14` |
+| `max_age_days` | Keep only items newer than this many days |
+| `updated_within_days` | Alias for `max_age_days` |
+| `min_age_days` | Keep only items at least this many days old |
+| `updated_after` / `updated_before` | ISO date/time or epoch bounds |
+| `date_from` / `date_to` | Date-range aliases for `YYYY-MM-DD` workflows |
+
+Recency-aware result rows include `source_timestamp`, `timestamp_source`, `last_updated`, `age_days`, `recency_score`, and `recency_label`. `timestamp_source` is one of `lcm_messages`, `lcm_conversations`, `daily_log_content`, or `geometry_last_update`.
+
 ### CSD Scoring (On New Message)
 
 When a new message arrives, the `CSDScorer` scores it against each candidate branch:
@@ -754,7 +789,19 @@ Combines LCM keyword search with geometry DB semantic search. Best for open-ende
 geometry-hybrid__hybrid_search(query="CLGK dashboard", top_n=5, retrieval_mode="factual")
 ```
 
-Returns combined results from both systems with recommendation.
+Recency-aware example:
+
+```
+geometry-hybrid__hybrid_search(
+  query="CLGK dashboard",
+  top_n=5,
+  retrieval_mode="factual",
+  recency_boost=0.35,
+  updated_within_days=14
+)
+```
+
+Returns combined results from both systems with recommendation. Result rows include original relevance (`total_score`), optional blended ordering score (`final_score`), and source-time recency metadata (`source_timestamp`, `timestamp_source`, `last_updated`, `age_days`, `recency_score`, `recency_label`).
 
 ### `geometry-hybrid__retrieval_feedback`
 

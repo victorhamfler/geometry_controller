@@ -72,6 +72,33 @@ For `hybrid_search`, use:
 - `retrieval_mode="factual"` when precision/reliability matters.
 - `retrieval_mode="exploratory"` when broad discovery matters.
 - `retrieval_mode="balanced"` for normal usage.
+- `recency_boost` when recent source memories should float up among relevant hits.
+- `updated_within_days` (alias of `max_age_days`) to restrict results to a recent window.
+
+Example recency-aware search:
+
+```python
+geometry-hybrid__hybrid_search(
+    query="geometry controller recency",
+    top_n=5,
+    retrieval_mode="balanced",
+    recency_boost=0.35,
+    updated_within_days=14,
+)
+```
+
+Recency fields in returned rows:
+
+| Field | Meaning |
+|---|---|
+| `source_timestamp` | Epoch timestamp used for recency |
+| `timestamp_source` | `lcm_messages`, `lcm_conversations`, `daily_log_content`, or `geometry_last_update` |
+| `last_updated` | ISO rendering of `source_timestamp` |
+| `age_days` | Age in days from source timestamp |
+| `recency_score` | Half-life freshness score |
+| `recency_label` | Human-readable age label |
+| `total_score` | Original semantic/trust ranking score |
+| `final_score` | Recency-blended ordering score when `recency_boost > 0` |
 
 For `backfill_lcm_conversations`:
 - Use `dry_run=true` for preview mode without embeddings.

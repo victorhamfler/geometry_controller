@@ -2,7 +2,20 @@
 
 Semantic memory overlay for OpenClaw LCM, with an MCP server that exposes geometry-aware tools.
 
-## Latest Update (2026-04-18)
+## Latest Update (2026-04-30)
+
+- Hybrid search recency controls:
+  - `recency_boost` blends source-time freshness with relevance while preserving the original `total_score`
+  - `recency_half_life_days` tunes freshness decay
+  - `max_age_days`, `updated_within_days`, `min_age_days`, `updated_after`, `updated_before`, `date_from`, and `date_to` filter results by source time
+- Geometry recency now uses source timestamps instead of polling timestamps:
+  - LCM message time via `memory_nodes.lcm_id` first
+  - LCM conversation creation time for `conv_*` fallback
+  - `daily_log_content.created_ts` for daily logs
+  - geometry `last_update_ts` only as a final fallback
+- Hybrid result rows now expose `source_timestamp`, `timestamp_source`, `last_updated`, `age_days`, `recency_score`, and `recency_label`.
+
+## Previous Update (2026-04-18)
 
 - Embedding runtime signature canonicalization fix (GGUF):
   - normalized `model_name` identity to basename for `llama_cpp`
@@ -312,7 +325,7 @@ Useful keys in `geometry_config`:
 
 ## MCP tools provided
 
-- `hybrid_search` - combined semantic + keyword retrieval with recommendation (`geometry` / `lcm` / `both`), now with optional `retrieval_mode` (`balanced` / `factual` / `exploratory`)
+- `hybrid_search` - combined semantic + keyword retrieval with recommendation (`geometry` / `lcm` / `both`), optional `retrieval_mode` (`balanced` / `factual` / `exploratory`), and source-time recency filtering/reranking
 - `retrieval_feedback` - record explicit feedback for `hybrid_search` results using `query_id` and `branch_id`
 - `branch_report` - branch diagnostics (state, regime, rank/coherence/anisotropy, etc.)
 - `geometry_stats` - global DB health and distribution stats
@@ -331,6 +344,39 @@ Useful keys in `geometry_config`:
 3. Pull text evidence with `conversation_content`.
 4. Run `sync_lcm_dag_edges` after major backfill/import refreshes to keep DAG link integrity validated.
 5. Re-run `lcm_geometry_backfill.py` periodically to keep geometry aligned with latest LCM data.
+
+## Hybrid Search Recency
+
+`hybrid_search` can filter and rerank results by the timestamp of the underlying memory source, not by geometry polling time.
+
+Useful parameters:
+
+- `recency_boost`: float in `[0, 1]`; `0` keeps relevance-only ranking, higher values blend freshness into `final_score`
+- `recency_half_life_days`: freshness half-life; default `14`
+- `max_age_days` / `updated_within_days`: only return items newer than this many days
+- `min_age_days`: only return items at least this old
+- `updated_after` / `updated_before`: ISO timestamp/date or epoch bounds
+- `date_from` / `date_to`: date-range aliases, useful with `YYYY-MM-DD`
+
+Result fields:
+
+- `total_score`: original geometry relevance/trust score
+- `final_score`: relevance blended with recency when `recency_boost > 0`
+- `source_timestamp`: canonical epoch timestamp used for recency
+- `timestamp_source`: one of `lcm_messages`, `lcm_conversations`, `daily_log_content`, or `geometry_last_update`
+- `last_updated`: ISO rendering of `source_timestamp`
+- `age_days`, `recency_score`, `recency_label`: human/debug recency fields
+
+Example:
+
+```json
+{
+  "query": "geometry controller recency",
+  "top_n": 5,
+  "recency_boost": 0.35,
+  "updated_within_days": 14
+}
+```
 
 ## One-command maintenance (Lossless cleanup + Geometry sync)
 
