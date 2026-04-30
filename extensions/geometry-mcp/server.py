@@ -225,7 +225,126 @@ def _normalize_snippet(text, max_chars=240):
     return clean[: max_len - 1].rstrip() + "..."
 
 
-def _score_lcm_keyword_matches(conv_id, matches, keywords, phrase):
+def _keyword_specificity_weights(conn, keywords):
+    if not keywords:
+        return {}
+    try:
+        total_row = conn.execute("SELECT COUNT(*) AS c FROM conversations").fetchone()
+        total_convs = max(1, int(total_row["c"] if total_row else 0))
+    except Exception:
+        total_convs = 1
+    weights = {}
+    for kw in keywords:
+        key = str(kw or "").lower()
+        if not key:
+            continue
+        try:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT conversation_id) AS c FROM messages WHERE LOWER(content) LIKE ?",
+                (f"%{key}%",),
+            ).fetchone()
+            df = max(1, int(row["c"] if row else 0))
+        except Exception:
+            df = total_convs
+        # Natural-log IDF, compressed to keep keyword rank explainable and bounded.
+        weights[key] = max(0.65, min(2.25, 1.0 + math.log((1.0 + total_convs) / (1.0 + df))))
+    return weights
+
+
+def _keyword_local_evidence(matches, keywords):
+    wanted = {str(k).lower(): str(k) for k in keywords}
+    groups = defaultdict(lambda: {
+        "keywords": set(),
+        "positions": {},
+        "phrase": False,
+        "all_keywords_in_message": False,
+        "snippet": "",
+        "created_at": None,
+    })
+    for m in matches:
+        mid = str(m.get("message_id") or "")
+        if not mid:
+            continue
+        g = groups[mid]
+        if not g["snippet"] and m.get("snippet"):
+            g["snippet"] = str(m.get("snippet") or "")
+        if not g["created_at"] and m.get("created_at"):
+            g["created_at"] = m.get("created_at")
+        if m.get("match_type") == "phrase":
+            g["phrase"] = True
+            for key in wanted:
+                g["keywords"].add(key)
+        else:
+            key = str(m.get("keyword_matched") or "").lower()
+            if key in wanted:
+                g["keywords"].add(key)
+                pos = _coerce_int(m.get("match_pos"), 0)
+                if pos > 0:
+                    g["positions"][key] = pos
+        if m.get("all_keywords_in_message"):
+            g["all_keywords_in_message"] = True
+    best = {
+        "best_local_terms": [],
+        "local_term_coverage": 0.0,
+        "best_local_match_count": 0,
+        "best_message_id": None,
+        "best_span_chars": None,
+        "term_proximity_score": 0.0,
+        "has_local_all_terms": False,
+    }
+    if not wanted or not groups:
+        return best
+    total = len(wanted)
+
+    def evidence_key(item):
+        mid, g = item
+        coverage = len(g["keywords"])
+        positions = [p for p in g["positions"].values() if p > 0]
+        span = (max(positions) - min(positions)) if len(positions) >= 2 else None
+        ts = _coerce_timestamp(g.get("created_at")) or 0.0
+        return (
+            1 if g["phrase"] else 0,
+            1 if g["all_keywords_in_message"] else 0,
+            coverage,
+            -span if span is not None else -999999,
+            ts,
+        )
+
+    best_mid, best_group = max(groups.items(), key=evidence_key)
+    best_terms = sorted([wanted[k] for k in best_group["keywords"]], key=lambda s: s.lower())
+    positions = [p for p in best_group["positions"].values() if p > 0]
+    span = (max(positions) - min(positions)) if len(positions) >= 2 else None
+    coverage = len(best_terms) / float(total)
+    proximity = 0.0
+    if best_group["phrase"]:
+        proximity = 1.0
+    elif span is not None:
+        if span <= 120:
+            proximity = 1.0
+        elif span <= 300:
+            proximity = 0.8
+        elif span <= 800:
+            proximity = 0.45
+        elif span <= 1600:
+            proximity = 0.2
+    elif best_group["all_keywords_in_message"]:
+        proximity = 0.8
+    elif len(best_terms) == 1 and total == 1:
+        proximity = 0.5
+    has_all = bool(best_group["phrase"] or (len(best_terms) >= total and proximity > 0.0))
+    best.update({
+        "best_local_terms": best_terms,
+        "local_term_coverage": round(coverage, 4),
+        "best_local_match_count": len(best_terms),
+        "best_message_id": best_mid,
+        "best_span_chars": span,
+        "term_proximity_score": round(proximity, 4),
+        "has_local_all_terms": bool(has_all),
+    })
+    return best
+
+
+def _score_lcm_keyword_matches(conv_id, matches, keywords, phrase, term_weights=None, semantic_meta=None):
     raw_count = len(matches)
     matched_keywords = sorted({
         str(m.get("keyword_matched") or "")
@@ -243,32 +362,103 @@ def _score_lcm_keyword_matches(conv_id, matches, keywords, phrase):
         phrase_hits > 0
         or len({k.lower() for k in matched_keywords}) >= len({k.lower() for k in keywords})
     )
+    weights = term_weights or {}
+    matched_weight = sum(weights.get(str(k).lower(), 1.0) for k in matched_keywords)
+    max_weight = sum(weights.get(str(k).lower(), 1.0) for k in keywords) or 1.0
+    evidence = _keyword_local_evidence(matches, keywords)
+    coverage = float(evidence.get("local_term_coverage") or 0.0)
+    proximity = float(evidence.get("term_proximity_score") or 0.0)
+    semantic = semantic_meta or {}
+    semantic_rank = semantic.get("rank")
+    semantic_score = _coerce_float(semantic.get("total_score"), None)
+    semantic_bonus = 0.0
+    semantic_label = "unmatched"
+    if semantic_rank is not None:
+        try:
+            rank_i = int(semantic_rank)
+            if rank_i <= 20:
+                semantic_bonus = 4.0
+                semantic_label = "strong"
+            elif rank_i <= 100:
+                semantic_bonus = 1.5
+                semantic_label = "weak"
+            else:
+                semantic_bonus = -2.5 if not phrase_hits else 0.0
+                semantic_label = "poor"
+        except Exception:
+            semantic_label = "unknown"
+    elif len(keywords) >= 3 and not phrase_hits:
+        semantic_bonus = -4.0
+        semantic_label = "missing"
+    local_all = bool(evidence.get("has_local_all_terms"))
     components = {
-        "unique_keyword_score": 2.0 * len(matched_keywords),
-        "all_keywords_bonus": 2.5 if all_keywords else 0.0,
+        "weighted_keyword_score": 2.0 * matched_weight,
+        "all_keywords_bonus": (2.5 if local_all or phrase_hits else 1.0) if all_keywords else 0.0,
         "phrase_bonus": (3.0 + math.log1p(min(phrase_hits, 10))) if phrase_hits > 0 else 0.0,
-        "capped_match_score": math.log1p(capped_count),
+        "local_coverage_score": 3.0 * coverage,
+        "local_all_terms_bonus": 2.0 if local_all and all_keywords else 0.0,
+        "term_proximity_score": 2.5 * proximity,
+        "capped_match_score": 0.75 * math.log1p(capped_count),
+        "scattered_terms_penalty": 0.0,
         "giant_conversation_penalty": 0.0,
+        "semantic_agreement_score": semantic_bonus,
     }
+    if len(keywords) >= 2 and all_keywords and not evidence.get("has_local_all_terms"):
+        components["scattered_terms_penalty"] = 2.5 * (1.0 - coverage)
     if raw_count > 200:
         components["giant_conversation_penalty"] = min(2.0, math.log1p(raw_count / 200.0))
     score = (
-        components["unique_keyword_score"]
+        components["weighted_keyword_score"]
         + components["all_keywords_bonus"]
         + components["phrase_bonus"]
+        + components["local_coverage_score"]
+        + components["local_all_terms_bonus"]
+        + components["term_proximity_score"]
         + components["capped_match_score"]
+        + components["semantic_agreement_score"]
+        - components["scattered_terms_penalty"]
         - components["giant_conversation_penalty"]
     )
+    reasons = []
+    if phrase_hits:
+        reasons.append("exact_phrase")
+    if evidence.get("has_local_all_terms"):
+        reasons.append("all_terms_in_one_message")
+    elif all_keywords:
+        reasons.append("all_terms_scattered")
+    if semantic_bonus > 0:
+        reasons.append(f"semantic_{semantic_label}")
+    elif semantic_bonus < 0:
+        reasons.append("semantic_poor")
+    if raw_count > 200:
+        reasons.append("large_conversation_penalty")
     return score, {
         "matched_keywords": matched_keywords,
         "phrase": phrase or None,
         "phrase_hits": phrase_hits,
         "all_keywords_matched": all_keywords,
+        "keyword_weight_sum": round(matched_weight, 4),
+        "keyword_weight_coverage": round(min(1.0, matched_weight / max_weight), 4),
+        "term_weights": {str(k): round(weights.get(str(k).lower(), 1.0), 4) for k in keywords},
+        "best_local_terms": evidence.get("best_local_terms", []),
+        "local_term_coverage": evidence.get("local_term_coverage", 0.0),
+        "best_local_match_count": evidence.get("best_local_match_count", 0),
+        "best_local_message_id": evidence.get("best_message_id"),
+        "best_span_chars": evidence.get("best_span_chars"),
+        "term_proximity_score": evidence.get("term_proximity_score", 0.0),
+        "has_local_all_terms": evidence.get("has_local_all_terms", False),
+        "semantic_agreement": {
+            "branch_id": semantic.get("branch_id"),
+            "rank": semantic_rank,
+            "total_score": round(semantic_score, 4) if semantic_score is not None else None,
+            "label": semantic_label,
+        },
+        "keyword_rank_reason": reasons,
         "raw_match_count": raw_count,
         "capped_match_count": capped_count,
         "match_cap": 40,
         "components": {k: round(v, 4) for k, v in components.items()},
-        "score_formula": "unique_keyword_score + all_keywords_bonus + phrase_bonus + capped_match_score - giant_conversation_penalty",
+        "score_formula": "weighted_keyword_score + all_keywords_bonus + phrase_bonus + local_coverage_score + local_all_terms_bonus + term_proximity_score + capped_match_score + semantic_agreement_score - scattered_terms_penalty - giant_conversation_penalty",
     }
 
 
@@ -1273,6 +1463,15 @@ def do_hybrid_search(
         include_states=set(include_states) if include_states else None,
         branch_ids=activity_branch_ids,
     )
+    semantic_by_branch = {
+        str(r.branch_id): {
+            "branch_id": str(r.branch_id),
+            "rank": i,
+            "total_score": float(getattr(r, "total_score", 0.0) or 0.0),
+            "sem_score": float(getattr(r, "sem_score", 0.0) or 0.0),
+        }
+        for i, r in enumerate(ranked, 1)
+    }
     geo_results = []
     implicit_feedback_logged = 0
     for r in ranked[:safe_top_n]:
@@ -1364,6 +1563,7 @@ def do_hybrid_search(
 
     results_by_conv = defaultdict(list)
     lower_keywords = [kw.lower() for kw in keywords]
+    term_weights = _keyword_specificity_weights(conn, keywords)
     for kw in keywords:
         keyword_limit = (
             max(5000, safe_top_n * 400)
@@ -1378,12 +1578,13 @@ def do_hybrid_search(
                      THEN SUBSTR(content, INSTR(LOWER(content), ?) - 100, 260)
                      ELSE SUBSTR(content, 1, 260)
                    END AS snippet,
+                   INSTR(LOWER(content), ?) AS match_pos,
                    token_count, created_at
             FROM messages
             WHERE LOWER(content) LIKE ?
             ORDER BY created_at DESC
             LIMIT ?
-        ''', [kw_lower, kw_lower, f'%{kw_lower}%', keyword_limit])
+        ''', [kw_lower, kw_lower, kw_lower, f'%{kw_lower}%', keyword_limit])
         for r in cur.fetchall():
             if not _timestamp_in_bounds(r['created_at'], updated_after_ts, updated_before_ts):
                 continue
@@ -1394,6 +1595,7 @@ def do_hybrid_search(
                 'snippet': r['snippet'],
                 'keyword_matched': kw,
                 'match_type': 'term',
+                'match_pos': r['match_pos'],
                 'all_keywords_in_message': bool(lower_keywords) and all(k in snippet_lower for k in lower_keywords),
                 'created_at': r['created_at']
             })
@@ -1411,12 +1613,13 @@ def do_hybrid_search(
                      THEN SUBSTR(content, INSTR(LOWER(content), ?) - 100, 260)
                      ELSE SUBSTR(content, 1, 260)
                    END AS snippet,
+                   INSTR(LOWER(content), ?) AS match_pos,
                    token_count, created_at
             FROM messages
             WHERE LOWER(content) LIKE ?
             ORDER BY created_at DESC
             LIMIT ?
-        ''', [phrase_lower, phrase_lower, f'%{phrase_lower}%', phrase_limit])
+        ''', [phrase_lower, phrase_lower, phrase_lower, f'%{phrase_lower}%', phrase_limit])
         for r in cur.fetchall():
             if not _timestamp_in_bounds(r['created_at'], updated_after_ts, updated_before_ts):
                 continue
@@ -1426,6 +1629,7 @@ def do_hybrid_search(
                 'snippet': r['snippet'],
                 'keyword_matched': phrase,
                 'match_type': 'phrase',
+                'match_pos': r['match_pos'],
                 'all_keywords_in_message': True,
                 'created_at': r['created_at']
             })
@@ -1446,9 +1650,18 @@ def do_hybrid_search(
             continue
         recency = _recency_meta(most_recent, half_life_days)
         activity = _activity_meta(most_recent, half_life_days)
-        raw_score, keyword_debug = _score_lcm_keyword_matches(conv_id, matches, keywords, phrase)
+        branch_id = f"conv_{conv_id}"
+        raw_score, keyword_debug = _score_lcm_keyword_matches(
+            conv_id,
+            matches,
+            keywords,
+            phrase,
+            term_weights=term_weights,
+            semantic_meta=semantic_by_branch.get(branch_id),
+        )
         scored.append({
             'conv_id': conv_id,
+            'branch_id': branch_id,
             'match_count': len(matches),
             'unique_keywords_matched': len(keyword_debug["matched_keywords"]),
             'matched_keywords': keyword_debug["matched_keywords"],
@@ -2336,7 +2549,8 @@ def do_conversation_content(
         "fallback": None if branch_id else fallback,
         "branches_returned": len(results),
         "total_entries": total_entries,
-        "results": results
+        "results": results,
+        "branches": results,
     }
 
 
@@ -2754,11 +2968,17 @@ async def call_tool(name, arguments):
                 score_part = (
                     f"final={c.get('final_score')} | " if recency_meta.get("boost", 0.0) else ""
                 )
+                dbg = c.get("keyword_debug", {})
+                sem = dbg.get("semantic_agreement", {}) or {}
+                reasons = ",".join((dbg.get("keyword_rank_reason") or [])[:3]) or "-"
                 lines.append(
                     f"  {i}. conv_{c['conv_id']} | {score_part}{c['unique_keywords_matched']} kw matched "
                     f"| score={c.get('raw_score')} | hits={c['total_matches']} "
-                    f"(cap={c.get('keyword_debug', {}).get('capped_match_count', c['total_matches'])}) "
-                    f"| phrase={bool(c.get('phrase_matched'))} | updated={c.get('recency_label', 'unknown')}"
+                    f"(cap={dbg.get('capped_match_count', c['total_matches'])}) "
+                    f"| phrase={bool(c.get('phrase_matched'))} "
+                    f"| local={dbg.get('local_term_coverage', 0)} "
+                    f"| sem={sem.get('label', 'unknown')} "
+                    f"| reason={reasons} | updated={c.get('recency_label', 'unknown')}"
                 )
                 lines.append(f"     \"{c['best_snippet']}\"")
             lines.append("")

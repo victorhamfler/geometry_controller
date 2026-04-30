@@ -84,9 +84,9 @@ The LCM keyword side also returns explainable ranking fields:
 |---|---|
 | `matched_keywords` | Meaningful query terms represented by this LCM conversation |
 | `phrase_matched` | Whether the exact normalized multi-term phrase matched |
-| `keyword_debug` | Score components, raw/capped hit counts, and phrase hit count |
+| `keyword_debug` | Score components, local coverage/proximity, term weights, semantic agreement, raw/capped hit counts, and phrase hit count |
 
-Keyword ranking favors exact phrase and all-term matches, caps raw hit-count influence, and lightly penalizes very large conversations. This helps exact queries find focused conversations instead of being dominated by large histories with many incidental mentions.
+Keyword ranking favors exact phrase matches, all-term local evidence, and LCM conversations whose `conv_N` branch also ranks well semantically. It caps raw hit-count influence, lightly penalizes very large conversations, and demotes broad non-phrase matches when terms are scattered or lack geometry agreement. This helps exact queries find focused conversations and helps broad queries avoid unrelated keyword coincidences.
 
 Example recency-aware search:
 
@@ -120,6 +120,8 @@ Recency fields in returned rows:
 | `recency_label` | Human-readable age label |
 | `total_score` | Original semantic/trust ranking score |
 | `final_score` | Recency-blended ordering score when `recency_boost > 0` |
+
+`conversation_content` returns branch payloads under `results` and also exposes `branches` as a compatibility alias for agents that expect branch-shaped output.
 
 For `backfill_lcm_conversations`:
 - Use `dry_run=true` for preview mode without embeddings.
